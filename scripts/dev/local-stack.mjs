@@ -145,6 +145,14 @@ if (!hasOpencode) {
   process.exit(1);
 }
 
+const hasBun = await commandExists("bun");
+if (!hasBun) {
+  log("[stack] Missing dependency: bun");
+  log("[stack] Bun is required to build openwork-server/sidecars.");
+  log("[stack] Install Bun: https://bun.sh");
+  process.exit(1);
+}
+
 const openworkBin = path.join(cwd, "packages/server/dist/bin/openwork-server");
 try {
   await access(openworkBin);
