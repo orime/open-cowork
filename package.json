@@ -2,6 +2,9 @@
   "name": "@different-ai/openwork-workspace",
   "private": true,
   "version": "0.0.0",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "dev": "pnpm --filter @different-ai/openwork dev",
     "dev:ui": "pnpm --filter @different-ai/openwork-ui dev",

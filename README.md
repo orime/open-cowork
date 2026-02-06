@@ -139,6 +139,11 @@ My First Cowork 的目标是把 OpenCode 能力变成「可视化、可配置、
 
 ## 5. 启动方式（按场景）
 
+### 5.0 前置条件
+
+- Node.js >= 18（建议用 nvm/volta 管理，`node -v` 可确认版本）
+- pnpm（`corepack enable` 或 `npm i -g pnpm`）
+
 ### 5.1 只看 UI（最快）
 
 ```bash

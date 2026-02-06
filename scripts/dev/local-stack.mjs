@@ -4,6 +4,27 @@ import { access } from "node:fs/promises";
 import { createServer } from "node:net";
 import path from "node:path";
 
+const requiredNodeMajor = 18;
+const nodeVersion = process.versions.node;
+const nodeMajor = Number(nodeVersion.split(".")[0]);
+const hasFetch = typeof globalThis.fetch === "function";
+
+if (!Number.isFinite(nodeMajor) || nodeMajor < requiredNodeMajor || !hasFetch) {
+  const reasons = [];
+  if (!Number.isFinite(nodeMajor) || nodeMajor < requiredNodeMajor) {
+    reasons.push(`Node.js >= ${requiredNodeMajor} required (current: ${nodeVersion})`);
+  }
+  if (!hasFetch) {
+    reasons.push("globalThis.fetch is unavailable");
+  }
+  process.stderr.write(
+    `[stack] Unsupported runtime.\n` +
+      `[stack] ${reasons.join("; ")}.\n` +
+      `[stack] Please upgrade Node.js to >= ${requiredNodeMajor} (e.g. via nvm or volta) and retry.\n`,
+  );
+  process.exit(1);
+}
+
 const cwd = process.cwd();
 const HOST = "127.0.0.1";
 
@@ -207,4 +228,3 @@ log(`[stack] Open: http://${HOST}:${webPort}`);
 log(`[stack] Token: ${token}`);
 log(`[stack] Host token: ${hostToken}`);
 log("[stack] Press Ctrl+C to stop all processes.");
-
