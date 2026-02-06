@@ -217,6 +217,16 @@ export default function SessionView(props: SessionViewProps) {
   const todoCompletedCount = createMemo(() =>
     todoList().filter((todo) => todo.status === "completed").length
   );
+  const permissionScopeLabel = createMemo(() => {
+    const patterns = props.activePermission?.patterns ?? [];
+    if (!patterns.length) return "All files in workspace";
+    return patterns.join(", ");
+  });
+  const permissionScopeNote = createMemo(() => {
+    const patterns = props.activePermission?.patterns ?? [];
+    if (patterns.length) return null;
+    return "No scope patterns were provided, so this permission applies broadly.";
+  });
   const todoLabel = createMemo(() => {
     const total = todoCount();
     if (!total) return "";
@@ -1644,8 +1654,11 @@ export default function SessionView(props: SessionViewProps) {
                 <div class="text-xs text-gray-10 uppercase tracking-wider mt-4 mb-2 font-semibold">Scope</div>
                 <div class="flex items-center gap-2 text-sm font-mono text-amber-12 bg-amber-1/30 px-2 py-1 rounded border border-amber-7/20">
                   <HardDrive size={12} />
-                  {props.activePermission?.patterns.join(", ")}
+                  {permissionScopeLabel()}
                 </div>
+                <Show when={permissionScopeNote()}>
+                  <p class="mt-2 text-xs text-gray-11">{permissionScopeNote()}</p>
+                </Show>
 
                 <Show when={Object.keys(props.activePermission?.metadata ?? {}).length > 0}>
                   <details class="mt-4 rounded-lg bg-gray-1/20 p-2">
