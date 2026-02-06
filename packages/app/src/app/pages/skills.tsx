@@ -18,6 +18,7 @@ export type SkillsViewProps = {
   installSkillCreator: () => void;
   revealSkillsFolder: () => void;
   uninstallSkill: (name: string) => void;
+  runSkill: (skill: SkillCard) => void | Promise<void>;
 };
 
 export default function SkillsView(props: SkillsViewProps) {
@@ -111,7 +112,7 @@ export default function SkillsView(props: SkillsViewProps) {
             type="text"
             value={searchQuery()}
             onInput={(event) => setSearchQuery(event.currentTarget.value)}
-            placeholder="Search skills"
+            placeholder={translate("skills.search_placeholder")}
             class="bg-dls-hover border border-dls-border rounded-lg py-1.5 pl-9 pr-4 text-xs w-48 focus:w-64 focus:outline-none transition-all"
           />
         </div>
@@ -126,16 +127,16 @@ export default function SkillsView(props: SkillsViewProps) {
           }`}
         >
           <Plus size={14} />
-          New skill
+          {translate("skills.new_skill")}
         </button>
       </div>
 
       <div class="space-y-2">
         <h2 class="text-3xl font-bold text-dls-text">{translate("skills.title")}</h2>
         <p class="text-sm text-dls-secondary">
-          {translate("skills.subtitle")} {" "}
+          {translate("skills.subtitle")}{" "}
           <button type="button" class="text-dls-accent hover:underline">
-            Learn more
+            {translate("skills.learn_more")}
           </button>
         </p>
         <Show when={props.accessHint}>
@@ -185,15 +186,25 @@ export default function SkillsView(props: SkillsViewProps) {
                       </Show>
                     </div>
                   </div>
-                  <button
-                    type="button"
-                    class="p-1.5 text-dls-secondary hover:text-dls-text hover:bg-dls-hover rounded-md transition-colors"
-                    onClick={() => setUninstallTarget(skill)}
-                    disabled={props.busy || !props.canUseDesktopTools}
-                    title={translate("skills.uninstall")}
-                  >
-                    <Edit2 size={14} />
-                  </button>
+                  <div class="flex items-center gap-2">
+                    <Button
+                      variant="outline"
+                      class="text-xs h-8 px-3"
+                      onClick={() => props.runSkill(skill)}
+                      disabled={props.busy}
+                    >
+                      {translate("skills.run")}
+                    </Button>
+                    <button
+                      type="button"
+                      class="p-1.5 text-dls-secondary hover:text-dls-text hover:bg-dls-hover rounded-md transition-colors"
+                      onClick={() => setUninstallTarget(skill)}
+                      disabled={props.busy || !props.canUseDesktopTools}
+                      title={translate("skills.uninstall")}
+                    >
+                      <Edit2 size={14} />
+                    </button>
+                  </div>
                 </div>
               )}
             </For>
@@ -202,7 +213,9 @@ export default function SkillsView(props: SkillsViewProps) {
       </div>
 
       <div class="space-y-4">
-        <h3 class="text-[11px] font-bold text-dls-secondary uppercase tracking-widest">Recommended</h3>
+        <h3 class="text-[11px] font-bold text-dls-secondary uppercase tracking-widest">
+          {translate("skills.recommended")}
+        </h3>
         <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
           <For each={recommendedSkills()}>
             {(item) => (

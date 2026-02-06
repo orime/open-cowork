@@ -24,3 +24,10 @@ vendor/opencode/
 # OpenCode local deps
 .opencode/node_modules/
 .opencode/bun.lock
+
+# OpenCode local runtime data (machine-specific)
+.opencode/tools/
+.opencode/*.db
+.opencode/*.db-*
+.opencode/logs/
+.opencode/state/

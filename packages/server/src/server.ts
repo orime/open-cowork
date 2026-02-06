@@ -8,6 +8,17 @@ import { addMcp, listMcp, removeMcp } from "./mcp.js";
 import { listSkills, upsertSkill } from "./skills.js";
 import { deleteCommand, listCommands, upsertCommand } from "./commands.js";
 import { deleteScheduledJob, listScheduledJobs, resolveScheduledJob } from "./scheduler.js";
+import {
+  readCoworkProviderRegistry,
+  writeCoworkProviderRegistry,
+  removeCoworkProvider,
+  readCoworkProviderSecrets,
+  setCoworkProviderSecret,
+  removeCoworkProviderSecret,
+  readCoworkProviderSecretValue,
+  resolveCoworkConfigDir,
+} from "./providers.js";
+import type { CoworkProviderRegistry } from "./providers.js";
 import { ApiError, formatError } from "./errors.js";
 import { readJsoncFile, updateJsoncTopLevel, writeJsoncFile } from "./jsonc.js";
 import { recordAudit, readAuditEntries, readLastAudit } from "./audit.js";
@@ -72,6 +83,61 @@ export function createServerLogger(config: ServerConfig): ServerLogger {
   };
 
   return { log: emit };
+}
+
+const normalizeBaseUrl = (value: string) => value.trim().replace(/\/+$/, "");
+
+const resolveApiBase = (baseUrl: string) => {
+  const trimmed = normalizeBaseUrl(baseUrl);
+  if (trimmed.endsWith("/v1")) return trimmed;
+  return `${trimmed}/v1`;
+};
+
+const isModelScopeEndpoint = (baseUrl: string) => /modelscope\.cn/i.test(baseUrl);
+
+type ImageGenerationPayload = {
+  data?: Array<{ b64_json?: string; url?: string }>;
+  output_images?: string[];
+  task_id?: string;
+  task_status?: string;
+  message?: string;
+  error?: string;
+};
+
+async function resolveCoworkProviderAuth(input: {
+  providerId?: string;
+  baseUrl?: string;
+  apiKey?: string;
+  allowFallback?: boolean;
+}): Promise<{ baseUrl: string; apiKey: string }> {
+  const providerId = input.providerId?.trim() ?? "";
+  const overrideBaseUrl = input.baseUrl?.trim() ?? "";
+  const overrideApiKey = input.apiKey?.trim() ?? "";
+
+  if (providerId) {
+    const registry = await readCoworkProviderRegistry();
+    const provider = registry.providers.find((entry) => entry.id === providerId);
+    if (!provider) {
+      if (input.allowFallback && overrideBaseUrl && overrideApiKey) {
+        return { baseUrl: overrideBaseUrl, apiKey: overrideApiKey };
+      }
+      throw new ApiError(404, "provider_not_found", "Provider not found");
+    }
+    const apiKey = (await readCoworkProviderSecretValue(provider.id)) ?? "";
+    if (!apiKey) {
+      if (input.allowFallback && overrideBaseUrl && overrideApiKey) {
+        return { baseUrl: overrideBaseUrl, apiKey: overrideApiKey };
+      }
+      throw new ApiError(400, "provider_missing_key", "API key missing for provider");
+    }
+    return { baseUrl: provider.baseUrl, apiKey };
+  }
+
+  if (!overrideBaseUrl || !overrideApiKey) {
+    throw new ApiError(400, "invalid_provider", "Provider baseUrl and apiKey are required");
+  }
+
+  return { baseUrl: overrideBaseUrl, apiKey: overrideApiKey };
 }
 
 function logRequest(input: {
@@ -357,6 +423,7 @@ function buildCapabilities(config: ServerConfig): Capabilities {
     mcp: { read: true, write: writeEnabled },
     commands: { read: true, write: writeEnabled },
     config: { read: true, write: writeEnabled },
+    providers: { read: true, write: writeEnabled },
   };
 }
 
@@ -431,6 +498,185 @@ function createRoutes(config: ServerConfig, approvals: ApprovalService): Route[]
 
   addRoute(routes, "GET", "/capabilities", "client", async () => {
     return jsonResponse(buildCapabilities(config));
+  });
+
+  addRoute(routes, "GET", "/providers", "client", async () => {
+    const registry = await readCoworkProviderRegistry();
+    return jsonResponse({ registry, configDir: resolveCoworkConfigDir() });
+  });
+
+  addRoute(routes, "PUT", "/providers", "host", async (ctx) => {
+    ensureWritable(config);
+    const body = await readJsonBody(ctx.request);
+    const registry = body.registry as CoworkProviderRegistry | undefined;
+    if (!registry) {
+      throw new ApiError(400, "invalid_payload", "registry is required");
+    }
+    const updated = await writeCoworkProviderRegistry(registry);
+    return jsonResponse({ registry: updated, configDir: resolveCoworkConfigDir() });
+  });
+
+  addRoute(routes, "DELETE", "/providers/:id", "host", async (ctx) => {
+    ensureWritable(config);
+    const id = ctx.params.id ?? "";
+    const registry = await removeCoworkProvider(id);
+    const secrets = await readCoworkProviderSecrets();
+    if (secrets.secrets[id]) {
+      await removeCoworkProviderSecret(id);
+    }
+    return jsonResponse({ registry, configDir: resolveCoworkConfigDir() });
+  });
+
+  addRoute(routes, "GET", "/providers/secrets", "host", async () => {
+    const secrets = await readCoworkProviderSecrets();
+    return jsonResponse({ secrets, configDir: resolveCoworkConfigDir() });
+  });
+
+  addRoute(routes, "POST", "/providers/:id/secret", "host", async (ctx) => {
+    ensureWritable(config);
+    const id = ctx.params.id ?? "";
+    const body = await readJsonBody(ctx.request);
+    const apiKey = typeof body.apiKey === "string" ? body.apiKey : "";
+    const secrets = await setCoworkProviderSecret(id, apiKey);
+    return jsonResponse({ secrets, configDir: resolveCoworkConfigDir() });
+  });
+
+  addRoute(routes, "DELETE", "/providers/:id/secret", "host", async (ctx) => {
+    ensureWritable(config);
+    const id = ctx.params.id ?? "";
+    const secrets = await removeCoworkProviderSecret(id);
+    return jsonResponse({ secrets, configDir: resolveCoworkConfigDir() });
+  });
+
+  addRoute(routes, "POST", "/providers/test", "client", async (ctx) => {
+    const body = await readJsonBody(ctx.request);
+    const providerId = typeof body.providerId === "string" ? body.providerId : undefined;
+    const baseUrl = typeof body.baseUrl === "string" ? body.baseUrl : undefined;
+    const apiKey = typeof body.apiKey === "string" ? body.apiKey : undefined;
+    const resolved = await resolveCoworkProviderAuth({
+      providerId,
+      baseUrl,
+      apiKey,
+      allowFallback: true,
+    });
+    const apiBase = resolveApiBase(resolved.baseUrl);
+    const response = await fetch(`${apiBase}/models`, {
+      headers: {
+        Authorization: `Bearer ${resolved.apiKey}`,
+      },
+    });
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      throw new ApiError(response.status, "provider_test_failed", text || response.statusText);
+    }
+    return jsonResponse({ ok: true, message: "Connected" });
+  });
+
+  addRoute(routes, "POST", "/cowork/chat", "client", async (ctx) => {
+    const body = await readJsonBody(ctx.request);
+    const providerId = typeof body.providerId === "string" ? body.providerId : "";
+    const baseUrl = typeof body.baseUrl === "string" ? body.baseUrl : undefined;
+    const apiKey = typeof body.apiKey === "string" ? body.apiKey : undefined;
+    const model = typeof body.model === "string" ? body.model : "";
+    const messages = Array.isArray(body.messages) ? body.messages : null;
+    if (!providerId || !model || !messages) {
+      throw new ApiError(400, "invalid_payload", "providerId, model, and messages are required");
+    }
+    const temperature = typeof body.temperature === "number" ? body.temperature : undefined;
+    const topP = typeof body.top_p === "number" ? body.top_p : undefined;
+    const maxTokens = typeof body.max_tokens === "number" ? body.max_tokens : undefined;
+    const resolved = await resolveCoworkProviderAuth({
+      providerId,
+      baseUrl,
+      apiKey,
+      allowFallback: true,
+    });
+    const apiBase = resolveApiBase(resolved.baseUrl);
+    const response = await fetch(`${apiBase}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${resolved.apiKey}`,
+      },
+      body: JSON.stringify({
+        model,
+        messages,
+        temperature,
+        top_p: topP,
+        max_tokens: maxTokens,
+        stream: true,
+      }),
+    });
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      throw new ApiError(response.status, "provider_chat_failed", text || response.statusText);
+    }
+    return new Response(response.body, {
+      status: response.status,
+      headers: {
+        "Content-Type": response.headers.get("content-type") ?? "text/event-stream",
+        "Cache-Control": "no-cache",
+      },
+    });
+  });
+
+  addRoute(routes, "POST", "/cowork/images", "client", async (ctx) => {
+    const body = await readJsonBody(ctx.request);
+    const providerId = typeof body.providerId === "string" ? body.providerId : "";
+    const baseUrl = typeof body.baseUrl === "string" ? body.baseUrl : undefined;
+    const apiKey = typeof body.apiKey === "string" ? body.apiKey : undefined;
+    const prompt = typeof body.prompt === "string" ? body.prompt : "";
+    if (!providerId || !prompt) {
+      throw new ApiError(400, "invalid_payload", "providerId and prompt are required");
+    }
+    const model = typeof body.model === "string" ? body.model : undefined;
+    const size = typeof body.size === "string" ? body.size : undefined;
+    const n = typeof body.n === "number" ? body.n : undefined;
+    const resolved = await resolveCoworkProviderAuth({
+      providerId,
+      baseUrl,
+      apiKey,
+      allowFallback: true,
+    });
+    const apiBase = resolveApiBase(resolved.baseUrl);
+    const modelscope = isModelScopeEndpoint(resolved.baseUrl);
+    const generationBody: Record<string, unknown> = {
+      model,
+      prompt,
+    };
+    if (!modelscope) {
+      generationBody.n = n ?? 1;
+      generationBody.size = size ?? "1024x1024";
+      generationBody.response_format = "b64_json";
+    } else {
+      if (typeof n === "number") generationBody.n = n;
+      if (size) generationBody.size = size;
+    }
+    const response = await fetch(`${apiBase}/images/generations`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${resolved.apiKey}`,
+        ...(modelscope ? { "X-ModelScope-Async-Mode": "true" } : {}),
+      },
+      body: JSON.stringify(generationBody),
+    });
+    const text = await response.text().catch(() => "");
+    const payload = normalizeImagePayload(parseJsonResponse(text));
+    if (!response.ok) {
+      const message = typeof payload.message === "string" && payload.message.trim()
+        ? payload.message
+        : response.statusText;
+      throw new ApiError(response.status, "provider_image_failed", message || response.statusText, payload);
+    }
+    const finalPayload = payload.task_id
+      ? await pollModelScopeTask({
+          apiBase,
+          apiKey: resolved.apiKey,
+          taskId: payload.task_id,
+        })
+      : payload;
+    return jsonResponse(toOpenAIImagePayload(finalPayload));
   });
 
   addRoute(routes, "GET", "/workspaces", "client", async () => {
@@ -982,6 +1228,67 @@ function parseJsonResponse(text: string): unknown {
   } catch {
     return trimmed;
   }
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const normalizeImagePayload = (value: unknown): ImageGenerationPayload => {
+  if (!value || typeof value !== "object") return {};
+  return value as ImageGenerationPayload;
+};
+
+async function pollModelScopeTask(input: {
+  apiBase: string;
+  apiKey: string;
+  taskId: string;
+  maxAttempts?: number;
+  intervalMs?: number;
+}) {
+  const maxAttempts = input.maxAttempts ?? 40;
+  const intervalMs = input.intervalMs ?? 1500;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const response = await fetch(`${input.apiBase}/tasks/${encodeURIComponent(input.taskId)}`, {
+      headers: {
+        Authorization: `Bearer ${input.apiKey}`,
+        "X-ModelScope-Task-Type": "image_generation",
+      },
+    });
+    const text = await response.text().catch(() => "");
+    const payload = normalizeImagePayload(parseJsonResponse(text));
+    if (!response.ok) {
+      throw new ApiError(response.status, "provider_image_failed", text || response.statusText, payload);
+    }
+    if (payload.task_status === "SUCCEED") {
+      return payload;
+    }
+    if (payload.task_status === "FAILED") {
+      throw new ApiError(502, "provider_image_failed", payload.error || payload.message || "Image generation failed", payload);
+    }
+    if (attempt < maxAttempts - 1) {
+      await sleep(intervalMs);
+    }
+  }
+
+  throw new ApiError(504, "provider_image_timeout", "Image generation timed out");
+}
+
+function toOpenAIImagePayload(payload: ImageGenerationPayload) {
+  const data: Array<{ b64_json?: string; url?: string }> = [];
+  for (const item of payload.data ?? []) {
+    if (item?.b64_json || item?.url) {
+      data.push({ b64_json: item.b64_json, url: item.url });
+    }
+  }
+  for (const imageUrl of payload.output_images ?? []) {
+    if (typeof imageUrl === "string" && imageUrl.trim()) {
+      data.push({ url: imageUrl });
+    }
+  }
+  if (!data.length) {
+    throw new ApiError(502, "provider_image_failed", "No image data returned", payload);
+  }
+  return { data };
 }
 
 function normalizeHealthPort(value: unknown): number | null {

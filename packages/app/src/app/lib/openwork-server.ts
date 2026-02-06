@@ -8,6 +8,7 @@ export type OpenworkServerCapabilities = {
   mcp: { read: boolean; write: boolean };
   commands: { read: boolean; write: boolean };
   config: { read: boolean; write: boolean };
+  providers: { read: boolean; write: boolean };
 };
 
 export type OpenworkServerStatus = "connected" | "disconnected" | "limited";
@@ -123,6 +124,45 @@ export type OpenworkReloadEvent = {
   reason: "plugins" | "skills" | "mcp" | "config";
   trigger?: OpenworkReloadTrigger;
   timestamp: number;
+};
+
+export type CoworkProviderKind = "openai_compatible";
+
+export type CoworkProvider = {
+  id: string;
+  name: string;
+  kind: CoworkProviderKind;
+  baseUrl: string;
+  modelCatalog: string[];
+  defaultModels?: {
+    chat?: string;
+    vision?: string;
+    image?: string;
+  };
+};
+
+export type CoworkProviderDefaults = {
+  chat?: { providerId: string; modelId: string };
+  vision?: { providerId: string; modelId: string };
+  image?: { providerId: string; modelId: string };
+};
+
+export type CoworkProviderRegistry = {
+  version: number;
+  updatedAt?: number;
+  providers: CoworkProvider[];
+  defaults?: CoworkProviderDefaults;
+};
+
+export type CoworkProviderSecrets = {
+  version: number;
+  updatedAt?: number;
+  secrets: Record<string, { apiKey: string }>;
+};
+
+export type CoworkProviderTestResult = {
+  ok: boolean;
+  message?: string;
 };
 
 export const DEFAULT_OPENWORK_SERVER_PORT = 8787;
@@ -317,15 +357,33 @@ async function requestJson<T>(
   });
 
   const text = await response.text();
-  const json = text ? JSON.parse(text) : null;
-
-  if (!response.ok) {
-    const code = typeof json?.code === "string" ? json.code : "request_failed";
-    const message = typeof json?.message === "string" ? json.message : response.statusText;
-    throw new OpenworkServerError(response.status, code, message, json?.details);
+  let json: unknown = null;
+  if (text) {
+    try {
+      json = JSON.parse(text);
+    } catch {
+      json = null;
+    }
   }
 
-  return json as T;
+  if (!response.ok) {
+    const record = json && typeof json === "object" ? (json as Record<string, unknown>) : null;
+    const code = typeof record?.code === "string" ? record.code : "request_failed";
+    const message = typeof record?.message === "string"
+      ? record.message
+      : text.trim() || response.statusText || "Request failed";
+    throw new OpenworkServerError(response.status, code, message, record?.details);
+  }
+
+  if (!json && text.trim()) {
+    throw new OpenworkServerError(
+      response.status,
+      "invalid_json_response",
+      "Server returned a non-JSON response",
+    );
+  }
+
+  return (json ?? null) as T;
 }
 
 export function createOpenworkServerClient(options: { baseUrl: string; token?: string; hostToken?: string }) {
@@ -477,6 +535,45 @@ export function createOpenworkServerClient(options: { baseUrl: string; token?: s
           method: "DELETE",
         },
       ),
+    listCoworkProviders: () =>
+      requestJson<{ registry: CoworkProviderRegistry; configDir?: string }>(baseUrl, "/providers", { token, hostToken }),
+    updateCoworkProviders: (registry: CoworkProviderRegistry) =>
+      requestJson<{ registry: CoworkProviderRegistry; configDir?: string }>(baseUrl, "/providers", {
+        token,
+        hostToken,
+        method: "PUT",
+        body: { registry },
+      }),
+    deleteCoworkProvider: (providerId: string) =>
+      requestJson<{ registry: CoworkProviderRegistry; configDir?: string }>(
+        baseUrl,
+        `/providers/${encodeURIComponent(providerId)}`,
+        { token, hostToken, method: "DELETE" },
+      ),
+    listCoworkProviderSecrets: () =>
+      requestJson<{ secrets: CoworkProviderSecrets; configDir?: string }>(baseUrl, "/providers/secrets", {
+        token,
+        hostToken,
+      }),
+    setCoworkProviderSecret: (providerId: string, apiKey: string) =>
+      requestJson<{ secrets: CoworkProviderSecrets; configDir?: string }>(
+        baseUrl,
+        `/providers/${encodeURIComponent(providerId)}/secret`,
+        { token, hostToken, method: "POST", body: { apiKey } },
+      ),
+    deleteCoworkProviderSecret: (providerId: string) =>
+      requestJson<{ secrets: CoworkProviderSecrets; configDir?: string }>(
+        baseUrl,
+        `/providers/${encodeURIComponent(providerId)}/secret`,
+        { token, hostToken, method: "DELETE" },
+      ),
+    testCoworkProvider: (payload: { providerId?: string; baseUrl?: string; apiKey?: string }) =>
+      requestJson<CoworkProviderTestResult>(baseUrl, "/providers/test", {
+        token,
+        hostToken,
+        method: "POST",
+        body: payload,
+      }),
   };
 }
 

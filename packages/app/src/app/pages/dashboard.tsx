@@ -17,6 +17,8 @@ import type { McpDirectoryInfo } from "../constants";
 import { formatRelativeTime } from "../utils";
 import type {
   OpenworkAuditEntry,
+  CoworkProvider,
+  CoworkProviderDefaults,
   OpenworkServerCapabilities,
   OpenworkServerDiagnostics,
   OpenworkServerSettings,
@@ -30,12 +32,16 @@ import PluginsView from "./plugins";
 import ScheduledTasksView from "./scheduled";
 import SettingsView from "./settings";
 import SkillsView from "./skills";
+import StudioView from "./studio";
 import StatusBar from "../components/status-bar";
+import LanguageDropdown from "../components/language-dropdown";
 import ProviderAuthModal from "../components/provider-auth-modal";
+import { currentLocale, t } from "../../i18n";
 import {
   Box,
   History,
   Loader2,
+  MessageCircle,
   MoreHorizontal,
   Plus,
   Settings,
@@ -57,6 +63,25 @@ export type DashboardViewProps = {
   closeProviderAuthModal: () => void;
   startProviderAuth: (providerId?: string) => Promise<string>;
   submitProviderApiKey: (providerId: string, apiKey: string) => Promise<string | void>;
+  coworkProviders: CoworkProvider[];
+  coworkDefaults: CoworkProviderDefaults;
+  coworkProviderSecrets: Record<string, string>;
+  coworkProviderSource: "server" | "local";
+  coworkProviderStatus: "idle" | "loading" | "error";
+  coworkProviderError: string | null;
+  refreshCoworkProviders: (source?: "server" | "local") => Promise<void> | void;
+  saveCoworkProvider: (provider: CoworkProvider) => Promise<void> | void;
+  deleteCoworkProvider: (providerId: string) => Promise<void> | void;
+  setCoworkDefaults: (defaults: CoworkProviderDefaults | undefined) => Promise<void> | void;
+  setCoworkProviderSecret: (providerId: string, apiKey: string) => Promise<void> | void;
+  clearCoworkProviderSecret: (providerId: string) => Promise<void> | void;
+  testCoworkProvider: (input: {
+    providerId?: string;
+    baseUrl: string;
+    apiKey: string;
+  }) => Promise<string>;
+  buildCoworkSnippet: (includeKeys?: boolean) => string;
+  coworkProxy: { enabled: boolean; baseUrl: string; token?: string; hostToken?: string };
   view: View;
   setView: (view: View, sessionId?: string) => void;
   startupPreference: StartupPreference | null;
@@ -124,6 +149,7 @@ export type DashboardViewProps = {
   installSkillCreator: () => void;
   revealSkillsFolder: () => void;
   uninstallSkill: (name: string) => void;
+  runSkill: (skill: SkillCard) => Promise<void> | void;
   pluginsAccessHint?: string | null;
   canEditPlugins: boolean;
   canUseGlobalPluginScope: boolean;
@@ -221,20 +247,23 @@ export type DashboardViewProps = {
 };
 
 export default function DashboardView(props: DashboardViewProps) {
+  const translate = (key: string) => t(key, currentLocale());
   const title = createMemo(() => {
     switch (props.tab) {
       case "scheduled":
-        return "Automations";
+        return translate("dashboard.automations");
       case "skills":
-        return "Skills";
+        return translate("dashboard.skills");
       case "plugins":
-        return "Plugins";
+        return translate("dashboard.plugins");
       case "mcp":
-        return "Apps";
+        return translate("dashboard.apps");
+      case "studio":
+        return translate("dashboard.studio");
       case "settings":
-        return "Settings";
+        return translate("dashboard.settings");
       default:
-        return "Automations";
+        return translate("dashboard.automations");
     }
   });
 
@@ -403,21 +432,22 @@ export default function DashboardView(props: DashboardViewProps) {
 
   return (
     <div class="flex h-screen w-full bg-dls-surface text-dls-text font-sans overflow-hidden">
-      <aside class="w-64 hidden md:flex flex-col bg-dls-sidebar border-r border-dls-border p-4">
+      <aside class="w-64 hidden md:flex flex-col bg-dls-sidebar border-r border-dls-border p-4 pb-20">
         <div class="space-y-0.5 mb-6 pt-2">
-          {navItem("scheduled", "Automations", <History size={18} />)}
-          {navItem("skills", "Skills", <Zap size={18} />)}
-          {navItem("mcp", "Apps", <Box size={18} />)}
+          {navItem("scheduled", translate("dashboard.automations"), <History size={18} />)}
+          {navItem("studio", translate("dashboard.studio"), <MessageCircle size={18} />)}
+          {navItem("skills", translate("dashboard.skills"), <Zap size={18} />)}
+          {navItem("mcp", translate("dashboard.apps"), <Box size={18} />)}
         </div>
 
         <div class="flex-1 overflow-y-auto">
           <div class="flex items-center justify-between text-[11px] font-bold text-dls-secondary uppercase px-3 mb-3 tracking-tight">
-            <span>Sessions</span>
+            <span>{translate("dashboard.sessions")}</span>
             <div class="flex gap-2 text-dls-secondary">
               <button
                 type="button"
                 class="hover:text-dls-text"
-                aria-label="New session"
+                aria-label={translate("dashboard.new_session")}
                 onClick={props.createSessionAndOpen}
                 disabled={props.newTaskDisabled}
               >
@@ -573,7 +603,7 @@ export default function DashboardView(props: DashboardViewProps) {
             class="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-medium text-dls-secondary hover:text-dls-text hover:bg-dls-hover"
           >
             <Plus size={14} />
-            Add a workspace
+            {translate("dashboard.add_workspace")}
           </button>
         </div>
 
@@ -584,7 +614,7 @@ export default function DashboardView(props: DashboardViewProps) {
             class="flex items-center gap-3 px-3 py-2 rounded-lg text-dls-secondary hover:bg-dls-hover transition-colors"
           >
             <Settings size={18} />
-            <span class="text-sm font-medium">Settings</span>
+            <span class="text-sm font-medium">{translate("dashboard.settings")}</span>
           </button>
         </div>
       </aside>
@@ -603,7 +633,9 @@ export default function DashboardView(props: DashboardViewProps) {
               <span class="text-xs text-dls-secondary">{props.busyHint}</span>
             </Show>
           </div>
-          <div class="flex items-center gap-2" />
+          <div class="flex items-center gap-2">
+            <LanguageDropdown />
+          </div>
         </header>
 
         <div class="p-6 md:p-10 max-w-5xl mx-auto space-y-10">
@@ -625,6 +657,15 @@ export default function DashboardView(props: DashboardViewProps) {
                 newTaskDisabled={props.newTaskDisabled}
               />
             </Match>
+            <Match when={props.tab === "studio"}>
+              <StudioView
+                providers={props.coworkProviders}
+                defaults={props.coworkDefaults}
+                secrets={props.coworkProviderSecrets}
+                providerSource={props.coworkProviderSource}
+                proxy={props.coworkProxy}
+              />
+            </Match>
             <Match when={props.tab === "skills"}>
               <SkillsView
                 busy={props.busy}
@@ -638,6 +679,7 @@ export default function DashboardView(props: DashboardViewProps) {
                 installSkillCreator={props.installSkillCreator}
                 revealSkillsFolder={props.revealSkillsFolder}
                 uninstallSkill={props.uninstallSkill}
+                runSkill={props.runSkill}
               />
             </Match>
 
@@ -695,6 +737,20 @@ export default function DashboardView(props: DashboardViewProps) {
                   providerConnectedIds={props.providerConnectedIds}
                   providerAuthBusy={props.providerAuthBusy}
                   openProviderAuthModal={props.openProviderAuthModal}
+                  coworkProviders={props.coworkProviders}
+                  coworkDefaults={props.coworkDefaults}
+                  coworkProviderSecrets={props.coworkProviderSecrets}
+                  coworkProviderSource={props.coworkProviderSource}
+                  coworkProviderStatus={props.coworkProviderStatus}
+                  coworkProviderError={props.coworkProviderError}
+                  refreshCoworkProviders={props.refreshCoworkProviders}
+                  saveCoworkProvider={props.saveCoworkProvider}
+                  deleteCoworkProvider={props.deleteCoworkProvider}
+                  setCoworkDefaults={props.setCoworkDefaults}
+                  setCoworkProviderSecret={props.setCoworkProviderSecret}
+                  clearCoworkProviderSecret={props.clearCoworkProviderSecret}
+                  testCoworkProvider={props.testCoworkProvider}
+                  buildCoworkSnippet={props.buildCoworkSnippet}
                   openworkServerStatus={props.openworkServerStatus}
                   openworkServerUrl={props.openworkServerUrl}
                   openworkServerSettings={props.openworkServerSettings}
@@ -823,7 +879,7 @@ export default function DashboardView(props: DashboardViewProps) {
             mcpStatuses={props.mcpStatuses}
           />
           <nav class="md:hidden border-t border-dls-border bg-dls-surface">
-            <div class="mx-auto max-w-5xl px-4 py-3 grid grid-cols-3 gap-2">
+            <div class="mx-auto max-w-5xl px-4 py-3 grid grid-cols-4 gap-2">
               <button
                 class={`flex flex-col items-center gap-1 text-xs ${
                   props.tab === "scheduled" ? "text-gray-12" : "text-gray-10"
@@ -831,7 +887,16 @@ export default function DashboardView(props: DashboardViewProps) {
                 onClick={() => props.setTab("scheduled")}
               >
                 <History size={18} />
-                Automations
+                {translate("dashboard.automations")}
+              </button>
+              <button
+                class={`flex flex-col items-center gap-1 text-xs ${
+                  props.tab === "studio" ? "text-gray-12" : "text-gray-10"
+                }`}
+                onClick={() => props.setTab("studio")}
+              >
+                <MessageCircle size={18} />
+                {translate("dashboard.studio")}
               </button>
               <button
                 class={`flex flex-col items-center gap-1 text-xs ${
@@ -840,7 +905,7 @@ export default function DashboardView(props: DashboardViewProps) {
                 onClick={() => props.setTab("skills")}
               >
                 <Zap size={18} />
-                Skills
+                {translate("dashboard.skills")}
               </button>
               <button
                 class={`flex flex-col items-center gap-1 text-xs ${
@@ -849,7 +914,7 @@ export default function DashboardView(props: DashboardViewProps) {
                 onClick={() => props.setTab("mcp")}
               >
                 <Box size={18} />
-                Apps
+                {translate("dashboard.apps")}
               </button>
             </div>
           </nav>

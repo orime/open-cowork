@@ -71,6 +71,122 @@ const DEFAULT_OWPENBOT_HEALTH_PORT = 3005;
 const DEFAULT_APPROVAL_TIMEOUT = 30000;
 const DEFAULT_OPENCODE_USERNAME = "opencode";
 
+type CoworkProvider = {
+  id: string;
+  name: string;
+  kind: "openai_compatible";
+  baseUrl: string;
+  modelCatalog: string[];
+  defaultModels?: {
+    chat?: string;
+    vision?: string;
+    image?: string;
+  };
+};
+
+type CoworkProviderDefaults = {
+  chat?: { providerId: string; modelId: string };
+  vision?: { providerId: string; modelId: string };
+  image?: { providerId: string; modelId: string };
+};
+
+type CoworkProviderRegistry = {
+  version: number;
+  updatedAt?: number;
+  providers: CoworkProvider[];
+  defaults?: CoworkProviderDefaults;
+};
+
+type CoworkProviderSecrets = {
+  version: number;
+  updatedAt?: number;
+  secrets: Record<string, { apiKey: string }>;
+};
+
+const defaultCoworkDir = () => join(homedir(), ".config", "my-first-cowork");
+
+const normalizeBaseUrl = (value: string) => value.trim().replace(/\/+$/, "");
+
+const readJsonFileSafe = async <T,>(path: string): Promise<T | null> => {
+  try {
+    const raw = await readFile(path, "utf8");
+    return JSON.parse(raw) as T;
+  } catch {
+    return null;
+  }
+};
+
+const readCoworkProviderRegistry = async (dir: string): Promise<CoworkProviderRegistry | null> => {
+  const registry = await readJsonFileSafe<CoworkProviderRegistry>(join(dir, "providers.json"));
+  if (!registry || !Array.isArray(registry.providers)) return null;
+  return registry;
+};
+
+const readCoworkProviderSecrets = async (dir: string): Promise<CoworkProviderSecrets | null> => {
+  const secrets = await readJsonFileSafe<CoworkProviderSecrets>(join(dir, "secrets.json"));
+  if (!secrets || typeof secrets.secrets !== "object") return null;
+  return secrets;
+};
+
+const buildCoworkOpencodeConfig = (
+  registry: CoworkProviderRegistry,
+  secrets: CoworkProviderSecrets | null,
+): string | null => {
+  if (!registry.providers?.length) return null;
+  const providerEntries: Record<string, unknown> = {};
+  for (const provider of registry.providers) {
+    const apiKey = secrets?.secrets?.[provider.id]?.apiKey?.trim();
+    providerEntries[provider.id] = {
+      npm: "@ai-sdk/openai-compatible",
+      name: provider.name,
+      options: {
+        baseURL: normalizeBaseUrl(provider.baseUrl),
+        ...(apiKey ? { apiKey } : {}),
+      },
+      models: Object.fromEntries(
+        (provider.modelCatalog ?? []).map((modelId) => [modelId, { name: modelId }]),
+      ),
+    };
+  }
+
+  const config: Record<string, unknown> = {
+    $schema: "https://opencode.ai/config.json",
+    provider: providerEntries,
+  };
+
+  const defaultChat = registry.defaults?.chat;
+  if (defaultChat?.providerId && defaultChat?.modelId) {
+    config.model = `${defaultChat.providerId}/${defaultChat.modelId}`;
+  }
+
+  return JSON.stringify(config);
+};
+
+const resolveCoworkImageEnv = (
+  registry: CoworkProviderRegistry,
+  secrets: CoworkProviderSecrets | null,
+) => {
+  const defaults = registry.defaults;
+  const providerId =
+    defaults?.image?.providerId ??
+    defaults?.chat?.providerId ??
+    registry.providers[0]?.id;
+  if (!providerId) return null;
+  const provider = registry.providers.find((item) => item.id === providerId);
+  if (!provider) return null;
+  const modelId =
+    defaults?.image?.modelId ??
+    provider.defaultModels?.image ??
+    provider.modelCatalog?.[0];
+  const apiKey = secrets?.secrets?.[providerId]?.apiKey?.trim();
+  if (!apiKey) return null;
+  return {
+    baseUrl: normalizeBaseUrl(provider.baseUrl),
+    apiKey,
+    model: modelId ?? "",
+  };
+};
+
 type ParsedArgs = {
   positionals: string[];
   flags: Map<string, string | boolean>;
@@ -1485,6 +1601,7 @@ function printHelp(): void {
     "",
     "Options:",
     "  --workspace <path>        Workspace directory (default: cwd)",
+    "  --providers-from <path>   Load Cowork providers from config dir (default: ~/.config/my-first-cowork)",
     "  --data-dir <path>         Data dir for openwrk router state",
     "  --daemon-host <host>      Host for openwrk router daemon (default: 127.0.0.1)",
     "  --daemon-port <port>      Port for openwrk router daemon (default: random)",
@@ -1567,6 +1684,8 @@ async function startOpencode(options: {
   logger: Logger;
   runId: string;
   logFormat: LogFormat;
+  configContent?: string;
+  extraEnv?: NodeJS.ProcessEnv;
 }) {
   const args = ["serve", "--hostname", options.bindHost, "--port", String(options.port)];
   for (const origin of options.corsOrigins) {
@@ -1578,6 +1697,7 @@ async function startOpencode(options: {
     stdio: ["ignore", "pipe", "pipe"],
     env: {
       ...process.env,
+      ...(options.extraEnv ?? {}),
       OPENCODE_CLIENT: "openwrk",
       OPENWORK: "1",
       OPENWRK_RUN_ID: options.runId,
@@ -1591,6 +1711,7 @@ async function startOpencode(options: {
       ),
       ...(options.username ? { OPENCODE_SERVER_USERNAME: options.username } : {}),
       ...(options.password ? { OPENCODE_SERVER_PASSWORD: options.password } : {}),
+      ...(options.configContent ? { OPENCODE_CONFIG_CONTENT: options.configContent } : {}),
     },
   });
 
@@ -3057,6 +3178,34 @@ async function runStart(args: ParsedArgs) {
     password: opencodePassword,
   });
 
+  const providersDir =
+    readFlag(args.flags, "providers-from") ??
+    process.env.MY_FIRST_COWORK_PROVIDERS_DIR ??
+    defaultCoworkDir();
+  const coworkRegistry = await readCoworkProviderRegistry(providersDir);
+  const coworkSecrets = coworkRegistry ? await readCoworkProviderSecrets(providersDir) : null;
+  const opencodeConfigContent = coworkRegistry ? buildCoworkOpencodeConfig(coworkRegistry, coworkSecrets) : null;
+  const coworkImageEnv = coworkRegistry ? resolveCoworkImageEnv(coworkRegistry, coworkSecrets) : null;
+  const opencodeExtraEnv: NodeJS.ProcessEnv | undefined = coworkImageEnv
+    ? {
+        MY_FIRST_COWORK_IMAGE_BASE_URL: coworkImageEnv.baseUrl,
+        MY_FIRST_COWORK_IMAGE_API_KEY: coworkImageEnv.apiKey,
+        ...(coworkImageEnv.model ? { MY_FIRST_COWORK_IMAGE_MODEL: coworkImageEnv.model } : {}),
+      }
+    : undefined;
+  if (verbose && coworkRegistry) {
+    logger.info(
+      "Cowork providers loaded",
+      {
+        dir: providersDir,
+        providers: coworkRegistry.providers.length,
+        defaults: coworkRegistry.defaults,
+        imageEnv: Boolean(coworkImageEnv),
+      },
+      "openwrk",
+    );
+  }
+
   const owpenbotHealthUrl = `http://127.0.0.1:${owpenbotHealthPort}`;
   const owpenbotEnv: NodeJS.ProcessEnv = {
     ...process.env,
@@ -3213,6 +3362,8 @@ async function runStart(args: ParsedArgs) {
       logger,
       runId,
       logFormat,
+      configContent: opencodeConfigContent ?? undefined,
+      extraEnv: opencodeExtraEnv,
     });
     children.push({ name: "opencode", child: opencodeChild });
     tui?.updateService("opencode", {

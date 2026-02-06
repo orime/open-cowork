@@ -6,6 +6,7 @@ import { Check, ChevronDown, Circle, Copy, File, Sparkles } from "lucide-solid";
 import type { MessageGroup, MessageWithParts } from "../../types";
 import { groupMessageParts, summarizeStep } from "../../utils";
 import PartView from "../part-view";
+import { currentLocale, t } from "../../../i18n";
 
 export type MessageListProps = {
   messages: MessageWithParts[];
@@ -32,11 +33,13 @@ type MessageBlock = {
   groups: MessageGroup[];
   isUser: boolean;
   messageId: string;
+  fallbackText?: string;
 };
 
 type MessageBlockItem = MessageBlock | StepClusterBlock;
 
 export default function MessageList(props: MessageListProps) {
+  const translate = (key: string) => t(key, currentLocale());
   const [copyingId, setCopyingId] = createSignal<string | null>(null);
   let copyTimeout: number | undefined;
   const isAttachmentPart = (part: Part) => {
@@ -123,7 +126,7 @@ export default function MessageList(props: MessageListProps) {
   const renderablePartsForMessage = (message: MessageWithParts) =>
     message.parts.filter((part) => {
       if (part.type === "reasoning") {
-        return props.developerMode && props.showThinking;
+        return props.showThinking;
       }
 
       if (part.type === "step-start" || part.type === "step-finish") {
@@ -148,6 +151,31 @@ export default function MessageList(props: MessageListProps) {
       const groupId = String((message.info as any).id ?? "message");
       const groups = groupMessageParts(renderableParts, groupId);
       const isUser = (message.info as any).role === "user";
+      const hasReasoningOnlyHidden =
+        !props.showThinking &&
+        !isUser &&
+        renderableParts.length === 0 &&
+        message.parts.some((part) => {
+          if (part.type !== "reasoning") return false;
+          const text = typeof (part as { text?: string }).text === "string"
+            ? (part as { text?: string }).text?.trim()
+            : "";
+          return Boolean(text);
+        });
+
+      if (hasReasoningOnlyHidden) {
+        blocks.push({
+          kind: "message",
+          message,
+          renderableParts: [],
+          groups: [],
+          isUser: false,
+          messageId,
+          fallbackText: translate("session.reasoning_only_hint"),
+        });
+        continue;
+      }
+
       const isStepsOnly = groups.length === 1 && groups[0].kind === "steps";
 
       if (isStepsOnly) {
@@ -327,6 +355,11 @@ export default function MessageList(props: MessageListProps) {
                         </div>
                       )}
                     </For>
+                  </div>
+                </Show>
+                <Show when={block.fallbackText}>
+                  <div class="rounded-xl border border-amber-7/30 bg-amber-2/40 px-3 py-2 text-sm text-amber-11">
+                    {block.fallbackText}
                   </div>
                 </Show>
                 <For each={block.groups}>

@@ -4,10 +4,13 @@ import { formatBytes, formatRelativeTime, isTauriRuntime } from "../utils";
 
 import Button from "../components/button";
 import TextInput from "../components/text-input";
+import CoworkProvidersSettings from "../components/cowork-providers-settings";
 import { HardDrive, MessageCircle, PlugZap, RefreshCcw, Shield, Smartphone, X } from "lucide-solid";
 import type { OpencodeConnectStatus, ProviderListItem, SettingsTab, StartupPreference } from "../types";
 import { createOpenworkServerClient } from "../lib/openwork-server";
 import type {
+  CoworkProvider,
+  CoworkProviderDefaults,
   OpenworkAuditEntry,
   OpenworkServerCapabilities,
   OpenworkServerDiagnostics,
@@ -38,6 +41,7 @@ import {
   getOwpenbotGroupsEnabled,
   setOwpenbotGroupsEnabled,
 } from "../lib/tauri";
+import { currentLocale, t } from "../../i18n";
 
 export type SettingsViewProps = {
   startupPreference: StartupPreference | null;
@@ -50,6 +54,24 @@ export type SettingsViewProps = {
   providerConnectedIds: string[];
   providerAuthBusy: boolean;
   openProviderAuthModal: () => Promise<void>;
+  coworkProviders: CoworkProvider[];
+  coworkDefaults: CoworkProviderDefaults;
+  coworkProviderSecrets: Record<string, string>;
+  coworkProviderSource: "server" | "local";
+  coworkProviderStatus: "idle" | "loading" | "error";
+  coworkProviderError: string | null;
+  refreshCoworkProviders: (source?: "server" | "local") => void | Promise<void>;
+  saveCoworkProvider: (provider: CoworkProvider) => void | Promise<void>;
+  deleteCoworkProvider: (providerId: string) => void | Promise<void>;
+  setCoworkDefaults: (defaults: CoworkProviderDefaults | undefined) => void | Promise<void>;
+  setCoworkProviderSecret: (providerId: string, apiKey: string) => void | Promise<void>;
+  clearCoworkProviderSecret: (providerId: string) => void | Promise<void>;
+  buildCoworkSnippet: (includeKeys?: boolean) => string;
+  testCoworkProvider: (input: {
+    providerId?: string;
+    baseUrl: string;
+    apiKey: string;
+  }) => Promise<string>;
   openworkServerStatus: OpenworkServerStatus;
   openworkServerUrl: string;
   openworkServerSettings: OpenworkServerSettings;
@@ -742,6 +764,7 @@ function OwpenbotSettings(props: {
 }
 
 export default function SettingsView(props: SettingsViewProps) {
+  const translate = (key: string) => t(key, currentLocale());
   const updateState = () => props.updateStatus?.state ?? "idle";
   const updateNotes = () => props.updateStatus?.notes ?? null;
   const updateVersion = () => props.updateStatus?.version ?? null;
@@ -792,32 +815,39 @@ export default function SettingsView(props: SettingsViewProps) {
     const state = updateState();
     const version = updateVersion();
     if (state === "available") {
-      return `Update available${version ? ` · v${version}` : ""}`;
+      return translate("settings.updater.toolbar_available").replace("{version}", version ? `v${version}` : "");
     }
     if (state === "ready") {
-      return `Ready to install${version ? ` · v${version}` : ""}`;
+      return translate("settings.updater.toolbar_ready").replace("{version}", version ? `v${version}` : "");
     }
     if (state === "downloading") {
       const downloaded = updateDownloadedBytes() ?? 0;
       const total = updateTotalBytes();
       const progress = total != null ? `${formatBytes(downloaded)} / ${formatBytes(total)}` : formatBytes(downloaded);
-      return `Downloading ${progress}`;
+      return translate("settings.updater.toolbar_downloading").replace("{progress}", progress);
     }
     if (state === "checking") {
-      return "Checking for updates";
+      return translate("settings.updater.toolbar_checking");
     }
     if (state === "error") {
-      return "Update check failed";
+      return translate("settings.updater.toolbar_error");
     }
-    return "Up to date";
+    return translate("settings.updater.toolbar_idle");
+  });
+  const updateToolbarDescription = createMemo(() => {
+    const state = updateState();
+    if (state === "available" || state === "ready") {
+      return translate("settings.updater.toolbar_description");
+    }
+    return "";
   });
 
   const updateToolbarActionLabel = createMemo(() => {
     const state = updateState();
-    if (state === "available") return "Download";
-    if (state === "ready") return "Install";
-    if (state === "error") return "Retry";
-    if (state === "idle") return "Check";
+    if (state === "available") return translate("settings.updater.action_download");
+    if (state === "ready") return translate("settings.updater.action_install_restart");
+    if (state === "error") return translate("settings.updater.action_retry");
+    if (state === "idle") return translate("settings.updater.action_check");
     return null;
   });
 
@@ -1057,10 +1087,10 @@ export default function SettingsView(props: SettingsViewProps) {
   });
 
   const openworkAuditStatusLabel = createMemo(() => {
-    if (!props.openworkServerWorkspaceId) return "Unavailable";
-    if (props.openworkAuditStatus === "loading") return "Loading";
-    if (props.openworkAuditStatus === "error") return "Error";
-    return "Ready";
+    if (!props.openworkServerWorkspaceId) return translate("settings.status.unavailable");
+    if (props.openworkAuditStatus === "loading") return translate("settings.status.loading");
+    if (props.openworkAuditStatus === "error") return translate("settings.status.error");
+    return translate("settings.status.ready");
   });
 
   const openworkAuditStatusStyle = createMemo(() => {
@@ -1073,30 +1103,32 @@ export default function SettingsView(props: SettingsViewProps) {
   const isLocalEngineRunning = createMemo(() => Boolean(props.engineInfo?.running));
   const isLocalPreference = createMemo(() => props.startupPreference === "local");
   const startupLabel = createMemo(() => {
-    if (props.startupPreference === "local") return "Start local server";
-    if (props.startupPreference === "server") return "Connect to server";
-    return "Not set";
+    if (props.startupPreference === "local") return translate("settings.startup.local");
+    if (props.startupPreference === "server") return translate("settings.startup.server");
+    return translate("settings.startup.not_set");
   });
 
   const tabLabel = (tab: SettingsTab) => {
     switch (tab) {
       case "model":
-        return "Model";
+        return translate("settings.tab.model");
+      case "providers":
+        return translate("settings.providers_tab");
       case "advanced":
-        return "Advanced";
+        return translate("settings.tab.advanced");
       case "remote":
-        return "Remote";
+        return translate("settings.tab.remote");
       case "messaging":
-        return "Messaging Bridge";
+        return translate("settings.tab.messaging");
       case "debug":
-        return "Debug";
+        return translate("settings.tab.debug");
       default:
-        return "General";
+        return translate("settings.tab.general");
     }
   };
 
   const availableTabs = createMemo<SettingsTab[]>(() => {
-    const tabs: SettingsTab[] = ["general", "model", "messaging", "remote", "advanced"];
+    const tabs: SettingsTab[] = ["general", "model", "providers", "messaging", "remote", "advanced"];
     if (props.developerMode) tabs.push("debug");
     return tabs;
   });
@@ -1281,10 +1313,17 @@ export default function SettingsView(props: SettingsViewProps) {
                 class="text-xs h-8 py-0 px-3"
                 onClick={handleUpdateToolbarAction}
                 disabled={updateToolbarDisabled()}
-                title={updateState() === "ready" && props.anyActiveRuns ? "Stop active runs to update" : ""}
+                title={
+                  updateState() === "ready" && props.anyActiveRuns
+                    ? translate("settings.updater.stop_runs_to_update")
+                    : ""
+                }
               >
                 {updateToolbarActionLabel()}
               </Button>
+            </Show>
+            <Show when={updateToolbarDescription()}>
+              <div class="text-[11px] text-gray-8 max-w-[280px]">{updateToolbarDescription()}</div>
             </Show>
           </div>
         </Show>
@@ -1320,7 +1359,9 @@ export default function SettingsView(props: SettingsViewProps) {
                 <div>
                   <div class="flex items-center gap-2">
                     <PlugZap size={16} class="text-gray-11" />
-                    <div class="text-sm font-medium text-gray-12">Providers</div>
+                    <div class="text-sm font-medium text-gray-12">
+                      {translate("settings.providers_title")}
+                    </div>
                   </div>
                   <div class="text-xs text-gray-10 mt-1">Connect services for models and tools.</div>
                 </div>
@@ -1447,6 +1488,25 @@ export default function SettingsView(props: SettingsViewProps) {
           </div>
         </Match>
 
+        <Match when={activeTab() === "providers"}>
+          <CoworkProvidersSettings
+            providers={props.coworkProviders}
+            defaults={props.coworkDefaults}
+            secrets={props.coworkProviderSecrets}
+            source={props.coworkProviderSource}
+            status={props.coworkProviderStatus}
+            error={props.coworkProviderError}
+            onRefresh={props.refreshCoworkProviders}
+            onSaveProvider={props.saveCoworkProvider}
+            onDeleteProvider={props.deleteCoworkProvider}
+            onSetDefaults={props.setCoworkDefaults}
+            onSetSecret={props.setCoworkProviderSecret}
+            onClearSecret={props.clearCoworkProviderSecret}
+            buildSnippet={props.buildCoworkSnippet}
+            onTestProvider={props.testCoworkProvider}
+          />
+        </Match>
+
         <Match when={activeTab() === "advanced"}>
           <div class="space-y-6">
             <div class="bg-gray-2/30 border border-gray-6/50 rounded-2xl p-5 space-y-3">
@@ -1467,8 +1527,8 @@ export default function SettingsView(props: SettingsViewProps) {
                       <>
                         <div class="flex items-center justify-between bg-gray-1 p-3 rounded-xl border border-gray-6">
                           <div class="space-y-0.5">
-                            <div class="text-sm text-gray-12">Automatic checks</div>
-                            <div class="text-xs text-gray-7">Once per day (quiet)</div>
+                            <div class="text-sm text-gray-12">{translate("settings.updater.auto_checks")}</div>
+                            <div class="text-xs text-gray-7">{translate("settings.updater.auto_checks_hint")}</div>
                           </div>
                           <button
                             class={`px-3 py-1 rounded-full text-xs font-medium border transition-colors ${
@@ -1478,7 +1538,7 @@ export default function SettingsView(props: SettingsViewProps) {
                             }`}
                             onClick={props.toggleUpdateAutoCheck}
                           >
-                            {props.updateAutoCheck ? "On" : "Off"}
+                            {props.updateAutoCheck ? translate("common.on") : translate("common.off")}
                           </button>
                         </div>
 
@@ -1486,21 +1546,41 @@ export default function SettingsView(props: SettingsViewProps) {
                           <div class="space-y-0.5">
                             <div class="text-sm text-gray-12">
                               <Switch>
-                                <Match when={updateState() === "checking"}>Checking...</Match>
-                                <Match when={updateState() === "available"}>Update available: v{updateVersion()}</Match>
-                                <Match when={updateState() === "downloading"}>Downloading...</Match>
-                                <Match when={updateState() === "ready"}>Ready to install: v{updateVersion()}</Match>
-                                <Match when={updateState() === "error"}>Update check failed</Match>
-                                <Match when={true}>Up to date</Match>
+                                <Match when={updateState() === "checking"}>{translate("settings.updater.toolbar_checking")}</Match>
+                                <Match when={updateState() === "available"}>
+                                  {translate("settings.updater.toolbar_available").replace(
+                                    "{version}",
+                                    updateVersion() ? `v${updateVersion()}` : "",
+                                  )}
+                                </Match>
+                                <Match when={updateState() === "downloading"}>
+                                  {translate("settings.updater.toolbar_downloading").replace(
+                                    "{progress}",
+                                    formatBytes((updateDownloadedBytes() as number) ?? 0),
+                                  )}
+                                </Match>
+                                <Match when={updateState() === "ready"}>
+                                  {translate("settings.updater.toolbar_ready").replace(
+                                    "{version}",
+                                    updateVersion() ? `v${updateVersion()}` : "",
+                                  )}
+                                </Match>
+                                <Match when={updateState() === "error"}>{translate("settings.updater.toolbar_error")}</Match>
+                                <Match when={true}>{translate("settings.updater.toolbar_idle")}</Match>
                               </Switch>
                             </div>
                             <Show when={updateState() === "idle" && updateLastCheckedAt()}>
                               <div class="text-xs text-gray-7">
-                                Last checked {formatRelativeTime(updateLastCheckedAt() as number)}
+                                {translate("settings.updater.last_checked").replace(
+                                  "{time}",
+                                  formatRelativeTime(updateLastCheckedAt() as number),
+                                )}
                               </div>
                             </Show>
                             <Show when={updateState() === "available" && updateDate()}>
-                              <div class="text-xs text-gray-7">Published {updateDate()}</div>
+                              <div class="text-xs text-gray-7">
+                                {translate("settings.updater.published_at").replace("{date}", updateDate() ?? "")}
+                              </div>
                             </Show>
                             <Show when={updateState() === "downloading"}>
                               <div class="text-xs text-gray-7">
@@ -1522,7 +1602,7 @@ export default function SettingsView(props: SettingsViewProps) {
                               onClick={props.checkForUpdates}
                               disabled={props.busy || updateState() === "checking" || updateState() === "downloading"}
                             >
-                              Check
+                              {translate("settings.updater.action_check")}
                             </Button>
 
                             <Show when={updateState() === "available"}>
@@ -1532,7 +1612,7 @@ export default function SettingsView(props: SettingsViewProps) {
                                 onClick={props.downloadUpdate}
                                 disabled={props.busy || updateState() === "downloading"}
                               >
-                                Download
+                                {translate("settings.updater.action_download")}
                               </Button>
                             </Show>
 
@@ -1542,13 +1622,18 @@ export default function SettingsView(props: SettingsViewProps) {
                                 class="text-xs h-8 py-0 px-3"
                                 onClick={props.installUpdateAndRestart}
                                 disabled={props.busy || props.anyActiveRuns}
-                                title={props.anyActiveRuns ? "Stop active runs to update" : ""}
+                                title={props.anyActiveRuns ? translate("settings.updater.stop_runs_to_update") : ""}
                               >
-                                Install & Restart
+                                {translate("settings.updater.action_install_restart")}
                               </Button>
                             </Show>
                           </div>
                         </div>
+                        <Show when={updateState() === "ready" || updateState() === "available"}>
+                          <div class="rounded-xl bg-gray-1/20 border border-gray-6 p-3 text-xs text-gray-11">
+                            {translate("settings.updater.toolbar_description")}
+                          </div>
+                        </Show>
 
                         <Show when={updateState() === "available" && updateNotes()}>
                           <div class="rounded-xl bg-gray-1/20 border border-gray-6 p-3 text-xs text-gray-11 whitespace-pre-wrap max-h-40 overflow-auto">
@@ -1559,13 +1644,13 @@ export default function SettingsView(props: SettingsViewProps) {
                     }
                   >
                     <div class="rounded-xl bg-gray-1/20 border border-gray-6 p-3 text-sm text-gray-11">
-                      {props.updateEnv?.reason ?? "Updates are not supported in this environment."}
+                      {props.updateEnv?.reason ?? translate("settings.updates_not_supported")}
                     </div>
                   </Show>
                 }
               >
                 <div class="rounded-xl bg-gray-1/20 border border-gray-6 p-3 text-sm text-gray-11">
-                  Updates are only available in the desktop app.
+                  {translate("settings.updates_desktop_only")}
                 </div>
               </Show>
             </div>

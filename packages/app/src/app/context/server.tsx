@@ -16,6 +16,17 @@ export function serverDisplayName(url: string) {
   return url.replace(/^https?:\/\//, "").replace(/\/+$/, "");
 }
 
+const resolveOpenworkToken = () => {
+  if (typeof window === "undefined") return "";
+  const envToken = (import.meta as any).env?.VITE_OPENWORK_TOKEN as string | undefined;
+  if (typeof envToken === "string" && envToken.trim()) return envToken.trim();
+  try {
+    return window.localStorage.getItem("openwork.server.token")?.trim() ?? "";
+  } catch {
+    return "";
+  }
+};
+
 type ServerContextValue = {
   url: string;
   name: string;
@@ -59,10 +70,21 @@ export function ServerProvider(props: ParentProps & { defaultUrl: string }) {
 
     const storedList = readStoredList();
     const fallback = normalizeServerUrl(props.defaultUrl) ?? "";
+    const legacyDefault = normalizeServerUrl("http://127.0.0.1:4096") ?? "";
     const storedActive = normalizeServerUrl(readStoredActive());
 
-    const initialList = storedList.length ? storedList : fallback ? [fallback] : [];
-    const initialActive = storedActive || initialList[0] || fallback || "";
+    const preferFallback =
+      Boolean(fallback) && (!storedActive || storedActive === legacyDefault);
+
+    let initialList = storedList.length ? storedList : fallback ? [fallback] : [];
+    let initialActive = storedActive || initialList[0] || fallback || "";
+
+    if (preferFallback && fallback) {
+      initialActive = fallback;
+      if (!initialList.includes(fallback)) {
+        initialList = [fallback, ...initialList];
+      }
+    }
 
     setList(initialList);
     setActiveRaw(initialActive);
@@ -85,8 +107,16 @@ export function ServerProvider(props: ParentProps & { defaultUrl: string }) {
 
   const checkHealth = async (url: string) => {
     if (!url) return false;
+    const headers: Record<string, string> = {};
+    if (url.includes("/opencode")) {
+      const token = resolveOpenworkToken();
+      if (token) {
+        headers.Authorization = `Bearer ${token}`;
+      }
+    }
     const client = createOpencodeClient({
       baseUrl: url,
+      headers: Object.keys(headers).length ? headers : undefined,
       signal: AbortSignal.timeout(3000),
       fetch: isTauriRuntime() ? tauriFetch : undefined,
     });

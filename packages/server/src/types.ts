@@ -60,6 +60,7 @@ export interface Capabilities {
   mcp: { read: boolean; write: boolean };
   commands: { read: boolean; write: boolean };
   config: { read: boolean; write: boolean };
+  providers: { read: boolean; write: boolean };
 }
 
 export type ReloadReason = "plugins" | "skills" | "mcp" | "config";

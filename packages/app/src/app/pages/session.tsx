@@ -24,15 +24,22 @@ import type { WorkspaceInfo } from "../lib/tauri";
 
 import {
   Box,
+  Bug,
   Check,
   ChevronDown,
   HardDrive,
   History,
   Loader2,
+  MessageCircle,
   MoreHorizontal,
+  PanelRightClose,
+  PanelRightOpen,
   Plus,
+  RotateCcw,
   Settings,
   Shield,
+  Wifi,
+  WifiOff,
   Zap,
 } from "lucide-solid";
 
@@ -40,6 +47,7 @@ import Button from "../components/button";
 import RenameSessionModal from "../components/rename-session-modal";
 import ProviderAuthModal from "../components/provider-auth-modal";
 import StatusBar from "../components/status-bar";
+import LanguageDropdown from "../components/language-dropdown";
 import type { OpenworkServerStatus } from "../lib/openwork-server";
 import { join } from "@tauri-apps/api/path";
 import { formatRelativeTime, isTauriRuntime } from "../utils";
@@ -49,9 +57,11 @@ import Composer from "../components/session/composer";
 import type { SidebarSectionState } from "../components/session/sidebar";
 import FlyoutItem from "../components/flyout-item";
 import QuestionModal from "../components/question-modal";
+import { currentLocale, t } from "../../i18n";
 
 export type SessionViewProps = {
   selectedSessionId: string | null;
+  tab: DashboardTab;
   setView: (view: View, sessionId?: string) => void;
   setTab: (tab: DashboardTab) => void;
   setSettingsTab: (tab: SettingsTab) => void;
@@ -140,13 +150,43 @@ export type SessionViewProps = {
   setSessionAgent: (sessionId: string, agent: string | null) => void;
   saveSession: (sessionId: string) => Promise<string>;
   sessionStatusById: Record<string, string>;
+  sseConnected: boolean;
+  sessionLastEventAt: number | null;
+  sessionLastError: string | null;
+  pendingPermissionsCount: number;
   deleteSession: (sessionId: string) => Promise<void>;
+};
+
+type SessionStallHeuristic = {
+  isStalled: boolean;
+  idleMs: number;
+  reason: string;
+};
+
+type SessionDiagnosticsViewModel = {
+  sessionStatus: string;
+  sseConnected: boolean;
+  lastEventAt: number | null;
+  pendingPermissionsCount: number;
+  lastErrorMessage: string | null;
+  modelLabel: string;
+  runPhase: string;
+  runElapsedMs: number;
+  heuristic: SessionStallHeuristic;
+};
+
+type ThinkingSnapshot = {
+  status: string;
+  detail: { title: string; detail?: string } | null;
+  capturedAt: number;
 };
 
 export default function SessionView(props: SessionViewProps) {
   let messagesEndEl: HTMLDivElement | undefined;
   let chatContainerEl: HTMLDivElement | undefined;
   let agentPickerRef: HTMLDivElement | undefined;
+
+  const translate = (key: string) => t(key, currentLocale());
 
   const [toastMessage, setToastMessage] = createSignal<string | null>(null);
   const [providerAuthActionBusy, setProviderAuthActionBusy] = createSignal(false);
@@ -161,6 +201,7 @@ export default function SessionView(props: SessionViewProps) {
   const [autoScrollEnabled, setAutoScrollEnabled] = createSignal(false);
   const [scrollOnNextUpdate, setScrollOnNextUpdate] = createSignal(false);
   const [unreadCount, setUnreadCount] = createSignal(0);
+  const [diagnosticsOpen, setDiagnosticsOpen] = createSignal(false);
 
   const agentLabel = createMemo(() => props.selectedSessionAgent ?? "Default agent");
   const workspaceLabel = (workspace: WorkspaceInfo) =>
@@ -308,6 +349,7 @@ export default function SessionView(props: SessionViewProps) {
     partCount: 0,
   });
   const [thinkingExpanded, setThinkingExpanded] = createSignal(false);
+  const [lastThinkingSnapshot, setLastThinkingSnapshot] = createSignal<ThinkingSnapshot | null>(null);
 
   const lastAssistantSnapshot = createMemo(() => {
     for (let i = props.messages.length - 1; i >= 0; i -= 1) {
@@ -331,6 +373,8 @@ export default function SessionView(props: SessionViewProps) {
     setRunStartedAt(Date.now());
     setRunHasBegun(false);
     captureRunBaseline();
+    setLastThinkingSnapshot(null);
+    setThinkingExpanded(false);
   };
 
   const responseStarted = createMemo(() => {
@@ -455,6 +499,28 @@ export default function SessionView(props: SessionViewProps) {
     return null;
   });
 
+  const thinkingPanel = createMemo<null | { live: boolean; status: string; detail: { title: string; detail?: string } | null }>(
+    () => {
+      const status = thinkingStatus();
+      if (status) {
+        return {
+          live: true,
+          status,
+          detail: thinkingDetail(),
+        };
+      }
+      const snapshot = lastThinkingSnapshot();
+      if (!snapshot) return null;
+      return {
+        live: false,
+        status: snapshot.status,
+        detail: snapshot.detail,
+      };
+    },
+  );
+
+  const runFooterVisible = createMemo(() => showRunIndicator() || Boolean(thinkingPanel()));
+
   const runLabel = createMemo(() => {
     switch (runPhase()) {
       case "sending":
@@ -479,6 +545,39 @@ export default function SessionView(props: SessionViewProps) {
   });
 
   const runElapsedLabel = createMemo(() => `${Math.round(runElapsedMs()).toLocaleString()}ms`);
+  const stallHeuristic = createMemo<SessionStallHeuristic>(() => {
+    const status = runPhase();
+    const mayStall = status === "sending" || status === "thinking" || status === "retrying";
+    if (!mayStall || !runStartedAt() || responseStarted()) {
+      return { isStalled: false, idleMs: 0, reason: "" };
+    }
+    const lastSignalAt = Math.max(runStartedAt() ?? 0, props.sessionLastEventAt ?? 0);
+    const idleMs = Math.max(0, runTick() - lastSignalAt);
+    if (idleMs < 20_000) {
+      return { isStalled: false, idleMs, reason: "" };
+    }
+    if (!props.sseConnected) {
+      return { isStalled: true, idleMs, reason: "事件流已断开，当前会话无法继续接收增量。" };
+    }
+    if (props.pendingPermissionsCount > 0) {
+      return { isStalled: true, idleMs, reason: "有待处理权限请求，任务可能正在等待你的确认。" };
+    }
+    if (props.sessionLastError) {
+      return { isStalled: true, idleMs, reason: "会话遇到错误，请检查下方错误详情。" };
+    }
+    return { isStalled: true, idleMs, reason: "长时间未收到新事件，可能是模型响应慢或连接异常。" };
+  });
+  const diagnosticsModel = createMemo<SessionDiagnosticsViewModel>(() => ({
+    sessionStatus: props.sessionStatus,
+    sseConnected: props.sseConnected,
+    lastEventAt: props.sessionLastEventAt,
+    pendingPermissionsCount: props.pendingPermissionsCount,
+    lastErrorMessage: props.sessionLastError ?? props.error,
+    modelLabel: props.selectedSessionModelLabel || "Model",
+    runPhase: runPhase(),
+    runElapsedMs: runElapsedMs(),
+    heuristic: stallHeuristic(),
+  }));
 
   onMount(() => {
     setTimeout(() => setIsInitialLoad(false), 2000);
@@ -508,6 +607,33 @@ export default function SessionView(props: SessionViewProps) {
   });
 
   createEffect(() => {
+    if (!showRunIndicator()) return;
+    const status = thinkingStatus();
+    if (!status) return;
+    const detail = thinkingDetail();
+    setLastThinkingSnapshot((current) => {
+      const currentTitle = current?.detail?.title ?? "";
+      const currentDetail = current?.detail?.detail ?? "";
+      const nextTitle = detail?.title ?? "";
+      const nextDetail = detail?.detail ?? "";
+      if (current && current.status === status && currentTitle === nextTitle && currentDetail === nextDetail) {
+        return current;
+      }
+      return {
+        status,
+        detail: detail ? { ...detail } : null,
+        capturedAt: Date.now(),
+      };
+    });
+  });
+
+  createEffect(() => {
+    props.selectedSessionId;
+    setLastThinkingSnapshot(null);
+    setThinkingExpanded(false);
+  });
+
+  createEffect(() => {
     if (!runStartedAt()) return;
     if (props.sessionStatus === "idle" && runHasBegun() && !props.error) {
       setRunStartedAt(null);
@@ -524,7 +650,7 @@ export default function SessionView(props: SessionViewProps) {
   });
 
   createEffect(() => {
-    if (!thinkingStatus()) {
+    if (!thinkingPanel()) {
       setThinkingExpanded(false);
     }
   });
@@ -793,10 +919,15 @@ export default function SessionView(props: SessionViewProps) {
     scrollToLatest("smooth");
     setUnreadCount(0);
   };
+  const refreshCurrentSession = () => {
+    const sessionId = props.selectedSessionId;
+    if (!sessionId) return;
+    void Promise.resolve(props.selectSession(sessionId));
+  };
 
   return (
     <div class="flex h-screen w-full bg-dls-surface text-dls-text font-sans overflow-hidden">
-      <aside class="w-64 hidden md:flex flex-col bg-dls-sidebar border-r border-dls-border p-4">
+      <aside class="w-64 hidden md:flex flex-col bg-dls-sidebar border-r border-dls-border p-4 pb-20">
         <div class="space-y-0.5 mb-6 pt-2">
           <button
             type="button"
@@ -811,7 +942,22 @@ export default function SessionView(props: SessionViewProps) {
             }}
           >
             <History size={18} />
-            Automations
+            {translate("dashboard.automations")}
+          </button>
+          <button
+            type="button"
+            class={`w-full h-10 flex items-center gap-3 px-3 rounded-lg text-sm font-medium transition-colors ${
+              props.tab === "studio"
+                ? "bg-dls-active text-dls-text"
+                : "text-dls-secondary hover:text-dls-text hover:bg-dls-hover"
+            }`}
+            onClick={() => {
+              props.setTab("studio");
+              props.setView("dashboard");
+            }}
+          >
+            <MessageCircle size={18} />
+            {translate("dashboard.studio")}
           </button>
           <button
             type="button"
@@ -826,7 +972,7 @@ export default function SessionView(props: SessionViewProps) {
             }}
           >
             <Zap size={18} />
-            Skills
+            {translate("dashboard.skills")}
           </button>
           <button
             type="button"
@@ -841,18 +987,18 @@ export default function SessionView(props: SessionViewProps) {
             }}
           >
             <Box size={18} />
-            Apps
+            {translate("dashboard.apps")}
           </button>
         </div>
 
         <div class="flex-1 overflow-y-auto">
           <div class="flex items-center justify-between text-[11px] font-bold text-dls-secondary uppercase px-3 mb-3 tracking-tight">
-            <span>Sessions</span>
+            <span>{translate("dashboard.sessions")}</span>
             <div class="flex gap-2 text-dls-secondary">
               <button
                 type="button"
                 class="hover:text-dls-text"
-                aria-label="New session"
+                aria-label={translate("dashboard.new_session")}
                 onClick={props.createSessionAndOpen}
                 disabled={props.newTaskDisabled}
               >
@@ -1010,7 +1156,7 @@ export default function SessionView(props: SessionViewProps) {
             class="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-medium text-dls-secondary hover:text-dls-text hover:bg-dls-hover"
           >
             <Plus size={14} />
-            Add a workspace
+            {translate("dashboard.add_workspace")}
           </button>
         </div>
 
@@ -1021,7 +1167,7 @@ export default function SessionView(props: SessionViewProps) {
             class="flex items-center gap-3 px-3 py-2 rounded-lg text-dls-secondary hover:bg-dls-hover transition-colors"
           >
             <Settings size={18} />
-            <span class="text-sm font-medium">Settings</span>
+            <span class="text-sm font-medium">{translate("dashboard.settings")}</span>
           </button>
         </div>
       </aside>
@@ -1039,6 +1185,7 @@ export default function SessionView(props: SessionViewProps) {
               <span class="text-xs text-dls-secondary">· {props.busyHint}</span>
             </Show>
           </div>
+          <LanguageDropdown />
         </header>
 
       <Show when={props.error}>
@@ -1048,8 +1195,58 @@ export default function SessionView(props: SessionViewProps) {
           </div>
         </div>
       </Show>
+      <Show when={!props.clientConnected}>
+        <div class="mx-auto max-w-5xl w-full px-6 md:px-10 pt-3">
+          <div class="rounded-2xl border border-blue-7/40 bg-blue-2/50 px-4 py-3 text-xs text-blue-11 flex items-start justify-between gap-3">
+            <div>
+              <div class="font-semibold">{translate("session.engine_required_title")}</div>
+              <div class="mt-1">{translate("session.engine_required_description")}</div>
+            </div>
+            <Button
+              variant="outline"
+              class="text-xs h-7 px-3 shrink-0"
+              onClick={() => {
+                props.setTab("studio");
+                props.setView("dashboard");
+              }}
+            >
+              {translate("session.open_studio_mode")}
+            </Button>
+          </div>
+        </div>
+      </Show>
+      <Show when={diagnosticsModel().heuristic.isStalled && !diagnosticsOpen()}>
+        <div class="mx-auto max-w-5xl w-full px-6 md:px-10 pt-3">
+          <div class="rounded-2xl border border-amber-7/40 bg-amber-2/50 px-4 py-3 text-xs text-amber-11 flex items-start justify-between gap-3">
+            <div>
+              <div class="font-semibold">会话可能卡住</div>
+              <div class="mt-1">{diagnosticsModel().heuristic.reason}</div>
+            </div>
+            <Button
+              variant="outline"
+              class="text-xs h-7 px-3 shrink-0"
+              onClick={() => setDiagnosticsOpen(true)}
+            >
+              打开诊断
+            </Button>
+          </div>
+        </div>
+      </Show>
 
-      <div class="flex-1 flex overflow-hidden">
+      <div class="flex-1 flex overflow-hidden relative">
+        <div class="absolute right-4 top-4 z-20">
+          <button
+            type="button"
+            class="inline-flex items-center gap-1.5 rounded-lg border border-dls-border bg-dls-surface px-2.5 py-1.5 text-xs text-dls-secondary hover:text-dls-text hover:bg-dls-hover"
+            onClick={() => setDiagnosticsOpen((value) => !value)}
+          >
+            <Bug size={12} />
+            诊断
+            <Show when={diagnosticsOpen()} fallback={<PanelRightOpen size={12} />}>
+              <PanelRightClose size={12} />
+            </Show>
+          </button>
+        </div>
         <div
           class="flex-1 overflow-y-auto px-12 py-10 scroll-smooth relative bg-dls-surface"
           ref={(el) => (chatContainerEl = el)}
@@ -1146,10 +1343,11 @@ export default function SessionView(props: SessionViewProps) {
             expandedStepIds={props.expandedStepIds}
             setExpandedStepIds={props.setExpandedStepIds}
             footer={
-              showRunIndicator() ? (
+              runFooterVisible() ? (
                 <div class="flex justify-start pl-2">
                   <div class="w-full max-w-[68ch] space-y-2">
-                    <Show when={thinkingStatus()}>
+                    <Show when={thinkingPanel()}>
+                      {(panel) => (
                       <div class="rounded-xl border border-gray-6/70 bg-gray-2/40 px-3 py-2 text-xs text-gray-11">
                         <button
                           type="button"
@@ -1158,65 +1356,75 @@ export default function SessionView(props: SessionViewProps) {
                           aria-expanded={thinkingExpanded()}
                         >
                           <div class="flex items-center gap-2 min-w-0">
-                            <span class="text-[10px] uppercase tracking-wide text-gray-9">Thinking</span>
-                            <span class="truncate text-gray-12">{thinkingStatus()}</span>
+                            <span class="text-[10px] uppercase tracking-wide text-gray-9">
+                              {panel().live
+                                ? translate("session.thinking_live_badge")
+                                : translate("session.thinking_last_badge")}
+                            </span>
+                            <span class="truncate text-gray-12">{panel().status}</span>
                           </div>
                           <ChevronDown
                             size={12}
                             class={`text-gray-8 transition-transform ${thinkingExpanded() ? "rotate-180" : ""}`}
                           />
                         </button>
-                        <Show when={thinkingExpanded() && thinkingDetail()}>
-                          {(detail) => (
+                        <Show when={!panel().live}>
+                          <div class="mt-1 text-[11px] text-gray-9">{translate("session.thinking_snapshot_hint")}</div>
+                        </Show>
+                        <Show when={thinkingExpanded() && panel().detail}>
+                          {(detailSignal) => (
                             <div class="mt-2 text-xs text-gray-11">
-                              <div class="text-gray-12">{detail().title}</div>
-                              <Show when={detail().detail}>
-                                <div class="mt-1 whitespace-pre-wrap text-gray-10">{detail().detail}</div>
+                              <div class="text-gray-12">{detailSignal().title}</div>
+                              <Show when={detailSignal().detail}>
+                                <div class="mt-1 whitespace-pre-wrap text-gray-10">{detailSignal().detail}</div>
                               </Show>
                             </div>
                           )}
                         </Show>
                       </div>
+                      )}
                     </Show>
-                    <div
-                      class={`w-full flex items-center justify-between gap-3 text-xs ${runPhase() === "error" ? "text-red-11" : "text-gray-9"
-                        }`}
-                      role="status"
-                      aria-live="polite"
-                    >
-                      <div class="flex items-center gap-2 min-w-0">
-                        <Show
-                          when={runPhase() === "responding"}
-                          fallback={
-                            <span
-                              class={`h-1.5 w-1.5 rounded-full ${runPhase() === "error" ? "bg-red-9/80" : "bg-gray-8/80"
-                                }`}
-                            />
-                          }
-                        >
-                          <span class="flex items-center gap-1">
-                            <span
-                              class={`h-1.5 w-1.5 rounded-full animate-pulse ${runPhase() === "error" ? "bg-red-9/80" : "bg-gray-8/80"
-                                }`}
-                            />
-                            <span
-                              class={`h-1.5 w-1.5 rounded-full animate-pulse ${runPhase() === "error" ? "bg-red-9/60" : "bg-gray-8/60"
-                                }`}
-                              style={{ "animation-delay": "120ms" }}
-                            />
-                            <span
-                              class={`h-1.5 w-1.5 rounded-full animate-pulse ${runPhase() === "error" ? "bg-red-9/40" : "bg-gray-8/40"
-                                }`}
-                              style={{ "animation-delay": "240ms" }}
-                            />
-                          </span>
+                    <Show when={showRunIndicator()}>
+                      <div
+                        class={`w-full flex items-center justify-between gap-3 text-xs ${runPhase() === "error" ? "text-red-11" : "text-gray-9"
+                          }`}
+                        role="status"
+                        aria-live="polite"
+                      >
+                        <div class="flex items-center gap-2 min-w-0">
+                          <Show
+                            when={runPhase() === "responding"}
+                            fallback={
+                              <span
+                                class={`h-1.5 w-1.5 rounded-full ${runPhase() === "error" ? "bg-red-9/80" : "bg-gray-8/80"
+                                  }`}
+                              />
+                            }
+                          >
+                            <span class="flex items-center gap-1">
+                              <span
+                                class={`h-1.5 w-1.5 rounded-full animate-pulse ${runPhase() === "error" ? "bg-red-9/80" : "bg-gray-8/80"
+                                  }`}
+                              />
+                              <span
+                                class={`h-1.5 w-1.5 rounded-full animate-pulse ${runPhase() === "error" ? "bg-red-9/60" : "bg-gray-8/60"
+                                  }`}
+                                style={{ "animation-delay": "120ms" }}
+                              />
+                              <span
+                                class={`h-1.5 w-1.5 rounded-full animate-pulse ${runPhase() === "error" ? "bg-red-9/40" : "bg-gray-8/40"
+                                  }`}
+                                style={{ "animation-delay": "240ms" }}
+                              />
+                            </span>
+                          </Show>
+                          <span class="truncate">{runLabel()}</span>
+                        </div>
+                        <Show when={props.developerMode}>
+                          <span class="shrink-0 text-[10px] text-gray-8">{runElapsedLabel()}</span>
                         </Show>
-                        <span class="truncate">{runLabel()}</span>
                       </div>
-                      <Show when={props.developerMode}>
-                        <span class="shrink-0 text-[10px] text-gray-8">{runElapsedLabel()}</span>
-                      </Show>
-                    </div>
+                    </Show>
                   </div>
                 </div>
               ) : undefined
@@ -1238,6 +1446,88 @@ export default function SessionView(props: SessionViewProps) {
           <div ref={(el) => (messagesEndEl = el)} />
           </div>
         </div>
+        <aside
+          class={`absolute right-0 top-0 z-10 h-full w-[320px] border-l border-dls-border bg-dls-surface/95 backdrop-blur-sm px-4 py-4 overflow-y-auto transition-transform duration-200 ${
+            diagnosticsOpen() ? "translate-x-0" : "translate-x-full pointer-events-none"
+          }`}
+        >
+          <div class="space-y-4 text-xs">
+            <div>
+              <div class="text-sm font-semibold text-dls-text">会话诊断</div>
+              <div class="text-dls-secondary mt-1">用于排查“发送后无返回/长时间 Sending”。</div>
+            </div>
+            <div class="rounded-xl border border-dls-border bg-dls-hover p-3 space-y-2">
+              <div class="flex items-center justify-between">
+                <span class="text-dls-secondary">事件流</span>
+                <span class={`inline-flex items-center gap-1 ${diagnosticsModel().sseConnected ? "text-green-11" : "text-red-11"}`}>
+                  <Show when={diagnosticsModel().sseConnected} fallback={<WifiOff size={12} />}>
+                    <Wifi size={12} />
+                  </Show>
+                  {diagnosticsModel().sseConnected ? "已连接" : "已断开"}
+                </span>
+              </div>
+              <div class="flex items-center justify-between">
+                <span class="text-dls-secondary">会话状态</span>
+                <span class="text-dls-text">{diagnosticsModel().sessionStatus}</span>
+              </div>
+              <div class="flex items-center justify-between">
+                <span class="text-dls-secondary">运行阶段</span>
+                <span class="text-dls-text">{diagnosticsModel().runPhase}</span>
+              </div>
+              <div class="flex items-center justify-between">
+                <span class="text-dls-secondary">最近事件</span>
+                <span class="text-dls-text">
+                  {diagnosticsModel().lastEventAt
+                    ? formatRelativeTime(diagnosticsModel().lastEventAt as number)
+                    : "暂无"}
+                </span>
+              </div>
+              <div class="flex items-center justify-between">
+                <span class="text-dls-secondary">静默时长</span>
+                <span class="text-dls-text">{Math.round(diagnosticsModel().heuristic.idleMs / 1000)}s</span>
+              </div>
+              <div class="flex items-center justify-between">
+                <span class="text-dls-secondary">待处理权限</span>
+                <span class="text-dls-text">{diagnosticsModel().pendingPermissionsCount}</span>
+              </div>
+              <div class="flex items-center justify-between">
+                <span class="text-dls-secondary">当前模型</span>
+                <span class="text-dls-text text-right max-w-[180px] truncate">{diagnosticsModel().modelLabel}</span>
+              </div>
+            </div>
+            <Show when={diagnosticsModel().heuristic.isStalled}>
+              <div class="rounded-xl border border-amber-7/30 bg-amber-2/40 p-3 text-amber-11">
+                <div class="font-semibold">可能卡住</div>
+                <div class="mt-1">{diagnosticsModel().heuristic.reason}</div>
+              </div>
+            </Show>
+            <Show when={diagnosticsModel().lastErrorMessage}>
+              <div class="rounded-xl border border-red-7/30 bg-red-2/40 p-3 text-red-11 whitespace-pre-wrap">
+                <div class="font-semibold">最近错误</div>
+                <div class="mt-1">{diagnosticsModel().lastErrorMessage}</div>
+              </div>
+            </Show>
+            <div class="space-y-2">
+              <div class="text-dls-secondary">建议操作</div>
+              <div class="grid grid-cols-2 gap-2">
+                <Button variant="outline" class="text-xs h-8 px-2" onClick={refreshCurrentSession}>
+                  <RotateCcw size={12} />
+                  刷新会话
+                </Button>
+                <Button variant="outline" class="text-xs h-8 px-2" onClick={() => openSettings("providers")}>
+                  <Settings size={12} />
+                  检查模型
+                </Button>
+                <Button variant="outline" class="text-xs h-8 px-2" onClick={openProviderAuth}>
+                  重新认证
+                </Button>
+                <Button variant="outline" class="text-xs h-8 px-2" onClick={openMcp}>
+                  打开应用
+                </Button>
+              </div>
+            </div>
+          </div>
+        </aside>
 
       </div>
 

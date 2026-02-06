@@ -20,6 +20,25 @@ OpenWork releases should be deterministic, easy to reproduce, and fully verifiab
    - `git tag vX.Y.Z`
    - `git push origin vX.Y.Z`
 
+### One-click CI packaging (macOS + Windows + Linux)
+
+Trigger the existing `Release App` workflow (matrix builds) with one command:
+
+- `pnpm release:desktop -- --tag vX.Y.Z`
+
+Optional flags:
+
+- `--repo owner/repo` (default: auto-detected from `remote.origin.url`)
+- `--notarize true|false` (default: `true`)
+- `--draft true|false` (default: `false`)
+- `--prerelease true|false` (default: `false`)
+- `--watch true|false` (default: `false`)
+
+Examples:
+
+- `pnpm release:desktop -- --tag v0.11.12 --watch true`
+- `pnpm release:desktop -- --tag v0.11.12 --notarize false --prerelease true`
+
 ## openwrk (npm + sidecars)
 
 1. Bump `packages/headless/package.json`.

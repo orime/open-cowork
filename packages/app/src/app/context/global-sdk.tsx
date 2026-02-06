@@ -13,6 +13,24 @@ import {
 import { usePlatform } from "./platform";
 import { useServer } from "./server";
 
+const resolveOpenworkToken = () => {
+  if (typeof window === "undefined") return "";
+  const envToken = (import.meta as any).env?.VITE_OPENWORK_TOKEN as string | undefined;
+  if (typeof envToken === "string" && envToken.trim()) return envToken.trim();
+  try {
+    return window.localStorage.getItem("openwork.server.token")?.trim() ?? "";
+  } catch {
+    return "";
+  }
+};
+
+const resolveHeadersForUrl = (baseUrl: string) => {
+  if (!baseUrl.includes("/opencode")) return undefined;
+  const token = resolveOpenworkToken();
+  if (!token) return undefined;
+  return { Authorization: `Bearer ${token}` } as Record<string, string>;
+};
+
 type GlobalSDKContextValue = {
   url: () => string;
   client: () => ReturnType<typeof createOpencodeClient>;
@@ -28,6 +46,7 @@ export function GlobalSDKProvider(props: ParentProps) {
   const [client, setClient] = createSignal(
     createOpencodeClient({
       baseUrl: server.url,
+      headers: resolveHeadersForUrl(server.url),
       fetch: platform.fetch,
       throwOnError: true,
     }),
@@ -37,10 +56,12 @@ export function GlobalSDKProvider(props: ParentProps) {
   createEffect(() => {
     const baseUrl = server.url;
     setUrl(baseUrl);
+    const headers = resolveHeadersForUrl(baseUrl);
 
     const abort = new AbortController();
     const eventClient = createOpencodeClient({
       baseUrl,
+      headers,
       signal: abort.signal,
       fetch: platform.fetch,
     });
@@ -48,6 +69,7 @@ export function GlobalSDKProvider(props: ParentProps) {
     setClient(
       createOpencodeClient({
         baseUrl,
+        headers,
         fetch: platform.fetch,
         throwOnError: true,
       }),

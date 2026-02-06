@@ -9,6 +9,7 @@ import {
   ChevronRight,
   Cloud,
   ExternalLink,
+  Edit2,
   FileCode,
   FileText,
   Gamepad2,

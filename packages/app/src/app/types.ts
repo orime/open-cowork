@@ -119,9 +119,10 @@ export type DashboardTab =
   | "skills"
   | "plugins"
   | "mcp"
+  | "studio"
   | "settings";
 
-export type SettingsTab = "general" | "model" | "advanced" | "remote" | "messaging" | "debug";
+export type SettingsTab = "general" | "model" | "providers" | "advanced" | "remote" | "messaging" | "debug";
 
 export type WorkspacePreset = "starter" | "automation" | "minimal";
 
@@ -234,6 +235,12 @@ export type TodoItem = {
 export type ModelRef = {
   providerID: string;
   modelID: string;
+};
+
+export type CoworkProviderDefaults = {
+  chat?: { providerId: string; modelId: string };
+  vision?: { providerId: string; modelId: string };
+  image?: { providerId: string; modelId: string };
 };
 
 export type ModelOption = {

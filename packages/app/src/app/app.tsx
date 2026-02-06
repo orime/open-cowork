@@ -33,6 +33,7 @@ import CreateWorkspaceModal from "./components/create-workspace-modal";
 import RenameWorkspaceModal from "./components/rename-workspace-modal";
 import McpAuthModal from "./components/mcp-auth-modal";
 import ReloadWorkspaceToast from "./components/reload-workspace-toast";
+import FirstRunWizard from "./components/first-run-wizard";
 import OnboardingView from "./pages/onboarding";
 import DashboardView from "./pages/dashboard";
 import SessionView from "./pages/session";
@@ -91,7 +92,7 @@ import {
   modelEquals,
   normalizeDirectoryPath,
 } from "./utils";
-import { currentLocale, setLocale, t, type Language } from "../i18n";
+import { currentLocale, setLocale, t } from "../i18n";
 import {
   isWindowsPlatform,
   lastUserModelFromMessages,
@@ -140,8 +141,22 @@ import {
   type OpenworkServerDiagnostics,
   type OpenworkServerStatus,
   type OpenworkServerSettings,
+  type CoworkProvider,
+  type CoworkProviderDefaults,
+  type CoworkProviderRegistry,
+  type CoworkProviderSecrets,
   OpenworkServerError,
 } from "./lib/openwork-server";
+import {
+  buildOpencodeConfigSnippet,
+  defaultCoworkRegistry,
+  normalizeCoworkRegistry,
+  readLocalCoworkRegistry,
+  readLocalCoworkSecrets,
+  writeLocalCoworkRegistry,
+  writeLocalCoworkSecrets,
+} from "./lib/cowork-providers";
+import { testOpenAICompatible, testOpenAICompatibleViaOpenwork } from "./lib/openai-compatible";
 
 export default function App() {
   type ProviderAuthMethod = { type: "oauth" | "api"; label: string };
@@ -247,34 +262,52 @@ export default function App() {
   const [openworkAuditStatus, setOpenworkAuditStatus] = createSignal<"idle" | "loading" | "error">("idle");
   const [openworkAuditError, setOpenworkAuditError] = createSignal<string | null>(null);
   const [devtoolsWorkspaceId, setDevtoolsWorkspaceId] = createSignal<string | null>(null);
-
+  const [coworkRegistry, setCoworkRegistry] = createSignal<CoworkProviderRegistry>(defaultCoworkRegistry());
+  const [coworkSecrets, setCoworkSecrets] = createSignal<Record<string, string>>({});
+  const [coworkProviderStatus, setCoworkProviderStatus] = createSignal<"idle" | "loading" | "error">("idle");
+  const [coworkProviderError, setCoworkProviderError] = createSignal<string | null>(null);
+  const [coworkProviderSource, setCoworkProviderSource] = createSignal<"server" | "local">("local");
+  const FIRST_RUN_WIZARD_DISMISSED_KEY = "openwork.firstRunWizardDismissed.v1";
+  const [firstRunWizardOpen, setFirstRunWizardOpen] = createSignal(false);
+  const [firstRunWizardDismissed, setFirstRunWizardDismissed] = createSignal(false);
+  const [firstRunProviderId, setFirstRunProviderId] = createSignal("");
+  const [firstRunApiKey, setFirstRunApiKey] = createSignal("");
+  const [firstRunProviderBusy, setFirstRunProviderBusy] = createSignal(false);
+  const [firstRunProviderError, setFirstRunProviderError] = createSignal<string | null>(null);
+  const [firstRunProviderStatus, setFirstRunProviderStatus] = createSignal<string | null>(null);
   const openworkServerBaseUrl = createMemo(() => {
     const pref = startupPreference();
     const hostInfo = openworkServerHostInfo();
     const settingsUrl = normalizeOpenworkServerUrl(openworkServerSettings().urlOverride ?? "") ?? "";
+    const hostUrl = hostInfo?.baseUrl ?? "";
 
-    if (pref === "local") return hostInfo?.baseUrl ?? "";
-    if (pref === "server") return settingsUrl;
-    return hostInfo?.baseUrl ?? settingsUrl;
+    if (pref === "local") return hostUrl || settingsUrl;
+    if (pref === "server") return settingsUrl || hostUrl;
+    return hostUrl || settingsUrl;
   });
 
   const openworkServerAuth = createMemo(() => {
-    const pref = startupPreference();
     const hostInfo = openworkServerHostInfo();
+    const baseUrl = openworkServerBaseUrl().trim();
+    const hostUrl = hostInfo?.baseUrl?.trim() ?? "";
     const settingsToken = openworkServerSettings().token?.trim() ?? "";
     const clientToken = hostInfo?.clientToken?.trim() ?? "";
     const hostToken = hostInfo?.hostToken?.trim() ?? "";
+    const normalizedBase = normalizeOpenworkServerUrl(baseUrl);
+    const normalizedHost = normalizeOpenworkServerUrl(hostUrl);
+    const isLocalServer = Boolean(normalizedBase && normalizedHost && normalizedBase === normalizedHost);
 
-    if (pref === "local") {
-      return { token: clientToken || undefined, hostToken: hostToken || undefined };
+    if (isLocalServer) {
+      return {
+        token: clientToken || settingsToken || undefined,
+        hostToken: hostToken || undefined,
+      };
     }
-    if (pref === "server") {
-      return { token: settingsToken || undefined, hostToken: undefined };
-    }
-    if (hostInfo?.baseUrl) {
-      return { token: clientToken || undefined, hostToken: hostToken || undefined };
-    }
-    return { token: settingsToken || undefined, hostToken: undefined };
+
+    return {
+      token: settingsToken || clientToken || undefined,
+      hostToken: undefined,
+    };
   });
 
   const openworkServerClient = createMemo(() => {
@@ -285,6 +318,22 @@ export default function App() {
   });
 
   const devtoolsOpenworkClient = createMemo(() => openworkServerClient());
+
+  const coworkProviders = createMemo(() => coworkRegistry().providers ?? []);
+  const coworkDefaults = createMemo(() => coworkRegistry().defaults ?? {});
+  const canUseProviderServer = createMemo(
+    () => openworkServerStatus() === "connected" && Boolean(openworkServerAuth().hostToken),
+  );
+  const coworkProxy = createMemo(() => {
+    const baseUrl = openworkServerBaseUrl().trim();
+    const auth = openworkServerAuth();
+    return {
+      enabled: openworkServerStatus() === "connected" && Boolean(baseUrl),
+      baseUrl,
+      token: auth.token,
+      hostToken: auth.hostToken,
+    };
+  });
 
   createEffect(() => {
     if (typeof window === "undefined") return;
@@ -307,11 +356,11 @@ export default function App() {
     const settingsUrl = normalizeOpenworkServerUrl(openworkServerSettings().urlOverride ?? "") ?? "";
 
     if (pref === "local") {
-      setOpenworkServerUrl(hostUrl);
+      setOpenworkServerUrl(hostUrl || settingsUrl);
       return;
     }
     if (pref === "server") {
-      setOpenworkServerUrl(settingsUrl);
+      setOpenworkServerUrl(settingsUrl || hostUrl);
       return;
     }
     setOpenworkServerUrl(hostUrl || settingsUrl);
@@ -340,6 +389,69 @@ export default function App() {
         return { status: "limited" as OpenworkServerStatus, capabilities: null };
       }
       return { status: "disconnected" as OpenworkServerStatus, capabilities: null };
+    }
+  };
+
+  const mapCoworkSecrets = (payload?: CoworkProviderSecrets | null) =>
+    Object.fromEntries(
+      Object.entries(payload?.secrets ?? {}).map(([id, entry]) => [id, entry.apiKey]).filter(([, value]) => Boolean(value)),
+    );
+
+  const sanitizeDefaults = (defaults: CoworkProviderDefaults | undefined, providers: CoworkProvider[]) => {
+    if (!defaults) return undefined;
+    const providerIds = new Set(providers.map((provider) => provider.id));
+    const normalize = (value?: { providerId: string; modelId: string }) => {
+      if (!value) return undefined;
+      if (!providerIds.has(value.providerId)) return undefined;
+      if (!value.modelId) return undefined;
+      return value;
+    };
+    return {
+      chat: normalize(defaults.chat),
+      vision: normalize(defaults.vision),
+      image: normalize(defaults.image),
+    };
+  };
+
+  let coworkLoadKey = "";
+  const loadCoworkProviders = async (sourceOverride?: "server" | "local") => {
+    const shouldUseServer = sourceOverride
+      ? sourceOverride === "server"
+      : canUseProviderServer();
+    const loadKey = shouldUseServer ? `server:${openworkServerBaseUrl()}` : "local";
+    if (coworkLoadKey === loadKey && sourceOverride == null) return;
+    coworkLoadKey = loadKey;
+    setCoworkProviderStatus("loading");
+    setCoworkProviderError(null);
+    try {
+      if (shouldUseServer) {
+        const client = openworkServerClient();
+        if (!client) throw new Error("OpenWork server unavailable");
+        const { registry } = await client.listCoworkProviders();
+        let secretsMap: Record<string, string> = {};
+        try {
+          const secretsPayload = await client.listCoworkProviderSecrets();
+          secretsMap = mapCoworkSecrets(secretsPayload.secrets);
+        } catch {
+          secretsMap = {};
+        }
+        const normalized = normalizeCoworkRegistry(registry);
+        setCoworkRegistry(normalized);
+        setCoworkSecrets(secretsMap);
+        setCoworkProviderSource("server");
+        setCoworkProviderStatus("idle");
+        return;
+      }
+
+      const localRegistry = normalizeCoworkRegistry(readLocalCoworkRegistry());
+      const localSecrets = readLocalCoworkSecrets();
+      setCoworkRegistry(localRegistry);
+      setCoworkSecrets(localSecrets);
+      setCoworkProviderSource("local");
+      setCoworkProviderStatus("idle");
+    } catch (error) {
+      setCoworkProviderStatus("error");
+      setCoworkProviderError(error instanceof Error ? error.message : "Failed to load providers");
     }
   };
 
@@ -395,6 +507,17 @@ export default function App() {
       active = false;
       if (timeoutId) window.clearTimeout(timeoutId);
     });
+  });
+
+  createEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!documentVisible()) return;
+    const useServer = canUseProviderServer();
+    const baseUrl = openworkServerBaseUrl();
+    const hostToken = openworkServerAuth().hostToken ?? "";
+    void loadCoworkProviders(useServer ? "server" : "local");
+    void baseUrl;
+    void hostToken;
   });
 
   createEffect(() => {
@@ -509,6 +632,16 @@ export default function App() {
   });
 
   createEffect(() => {
+    const defaults = coworkDefaults();
+    const current = defaultModel();
+    const next = defaults.chat;
+    if (!next?.providerId || !next?.modelId) return;
+    if (current.providerID === DEFAULT_MODEL.providerID && current.modelID === DEFAULT_MODEL.modelID) {
+      setDefaultModel({ providerID: next.providerId, modelID: next.modelId });
+    }
+  });
+
+  createEffect(() => {
     if (!isTauriRuntime()) return;
     if (!developerMode()) {
       setOpenwrkStatusState(null);
@@ -540,6 +673,8 @@ export default function App() {
     null
   );
   const [sseConnected, setSseConnected] = createSignal(false);
+  const [sessionLastEventAt, setSessionLastEventAt] = createSignal<number | null>(null);
+  const [sessionLastError, setSessionLastError] = createSignal<string | null>(null);
 
   const [busy, setBusy] = createSignal(false);
   const [busyLabel, setBusyLabel] = createSignal<string | null>(null);
@@ -615,6 +750,8 @@ export default function App() {
     developerMode,
     setError,
     setSseConnected,
+    onEventTimestamp: (timestamp) => setSessionLastEventAt(timestamp),
+    onSessionError: (message) => setSessionLastError(message),
     markReloadRequired: (reason, trigger) => markReloadRequiredRef(reason, trigger),
   });
 
@@ -755,18 +892,25 @@ export default function App() {
     if (!content && !resolvedDraft.attachments.length) return;
 
     const c = client();
-    if (!c) return;
+    if (!c) {
+      setError(t("app.connection_lost", currentLocale()));
+      return;
+    }
     let sessionID = selectedSessionId();
     if (!sessionID) {
       await createSessionAndOpen();
       sessionID = selectedSessionId();
     }
-    if (!sessionID) return;
+    if (!sessionID) {
+      setError("Unable to create or open a session.");
+      return;
+    }
 
     setBusy(true);
     setBusyLabel("status.running");
     setBusyStartedAt(Date.now());
     setError(null);
+    setSessionLastError(null);
 
     try {
       setLastPromptSent(content);
@@ -824,6 +968,21 @@ export default function App() {
       setBusyLabel(null);
       setBusyStartedAt(null);
     }
+  }
+
+  async function runSkill(skill: SkillCard) {
+    const name = skill.name?.trim();
+    if (!name) return;
+    const trigger = skill.trigger?.trim();
+    const promptText = trigger
+      ? `Use the skill "${name}" for this task.\nWhen to use: ${trigger}\n\nTask: `
+      : `Use the skill "${name}" for this task.\n\nTask: `;
+    await sendPrompt({
+      mode: "prompt",
+      parts: [{ type: "text", text: promptText }],
+      attachments: [],
+      text: promptText,
+    });
   }
 
   async function renameSessionTitle(sessionID: string, title: string) {
@@ -1587,6 +1746,288 @@ export default function App() {
     clearOpenworkServerSettings();
     setOpenworkServerSettings({});
   };
+
+  const persistCoworkRegistry = async (next: CoworkProviderRegistry) => {
+    if (canUseProviderServer()) {
+      const client = openworkServerClient();
+      if (!client) throw new Error("OpenWork server unavailable");
+      const response = await client.updateCoworkProviders(next);
+      const normalized = normalizeCoworkRegistry(response.registry);
+      setCoworkRegistry(normalized);
+      setCoworkProviderSource("server");
+      return normalized;
+    }
+    const stored = writeLocalCoworkRegistry(next);
+    setCoworkRegistry(stored);
+    setCoworkProviderSource("local");
+    return stored;
+  };
+
+  const upsertCoworkProvider = async (provider: CoworkProvider) => {
+    const current = coworkRegistry();
+    const normalized = normalizeCoworkRegistry(current);
+    const providers = normalized.providers.filter((item) => item.id !== provider.id);
+    providers.push(provider);
+    providers.sort((a, b) => a.name.localeCompare(b.name));
+    const nextDefaults = sanitizeDefaults(normalized.defaults, providers);
+    await persistCoworkRegistry({ ...normalized, providers, defaults: nextDefaults });
+  };
+
+  const deleteCoworkProvider = async (providerId: string) => {
+    const trimmed = providerId.trim();
+    if (!trimmed) return;
+    if (canUseProviderServer()) {
+      const client = openworkServerClient();
+      if (!client) throw new Error("OpenWork server unavailable");
+      const response = await client.deleteCoworkProvider(trimmed);
+      const normalized = normalizeCoworkRegistry(response.registry);
+      setCoworkRegistry(normalized);
+      setCoworkProviderSource("server");
+      try {
+        const secretsPayload = await client.listCoworkProviderSecrets();
+        setCoworkSecrets(mapCoworkSecrets(secretsPayload.secrets));
+      } catch {
+        setCoworkSecrets({});
+      }
+      return;
+    }
+
+    const nextRegistry = normalizeCoworkRegistry(coworkRegistry());
+    const providers = nextRegistry.providers.filter((item) => item.id !== trimmed);
+    const defaults = sanitizeDefaults(nextRegistry.defaults, providers);
+    await persistCoworkRegistry({ ...nextRegistry, providers, defaults });
+    const nextSecrets = { ...coworkSecrets() };
+    delete nextSecrets[trimmed];
+    writeLocalCoworkSecrets(nextSecrets);
+    setCoworkSecrets(nextSecrets);
+  };
+
+  const setCoworkProviderSecret = async (providerId: string, apiKey: string) => {
+    const trimmed = providerId.trim();
+    const key = apiKey.trim();
+    if (!trimmed) return;
+    if (canUseProviderServer()) {
+      const client = openworkServerClient();
+      if (!client) throw new Error("OpenWork server unavailable");
+      const response = await client.setCoworkProviderSecret(trimmed, key);
+      setCoworkSecrets(mapCoworkSecrets(response.secrets));
+      setCoworkProviderSource("server");
+      return;
+    }
+    const next = { ...coworkSecrets(), [trimmed]: key };
+    writeLocalCoworkSecrets(next);
+    setCoworkSecrets(next);
+    setCoworkProviderSource("local");
+  };
+
+  const clearCoworkProviderSecret = async (providerId: string) => {
+    const trimmed = providerId.trim();
+    if (!trimmed) return;
+    if (canUseProviderServer()) {
+      const client = openworkServerClient();
+      if (!client) throw new Error("OpenWork server unavailable");
+      const response = await client.deleteCoworkProviderSecret(trimmed);
+      setCoworkSecrets(mapCoworkSecrets(response.secrets));
+      setCoworkProviderSource("server");
+      return;
+    }
+    const next = { ...coworkSecrets() };
+    delete next[trimmed];
+    writeLocalCoworkSecrets(next);
+    setCoworkSecrets(next);
+    setCoworkProviderSource("local");
+  };
+
+  const updateCoworkDefaults = async (defaults: CoworkProviderDefaults | undefined) => {
+    const normalized = normalizeCoworkRegistry(coworkRegistry());
+    const nextDefaults = sanitizeDefaults(defaults, normalized.providers);
+    await persistCoworkRegistry({ ...normalized, defaults: nextDefaults });
+  };
+
+  const buildCoworkSnippet = (includeKeys = false) => {
+    return buildOpencodeConfigSnippet(coworkRegistry(), {
+      includeKeys,
+      secrets: coworkSecrets(),
+    });
+  };
+
+  const testCoworkProvider = async (input: {
+    providerId?: string;
+    baseUrl: string;
+    apiKey: string;
+  }) => {
+    const proxy = coworkProxy();
+    if (proxy.enabled) {
+      const client = openworkServerClient();
+      if (!client) throw new Error("OpenWork server unavailable");
+      const result = await client.testCoworkProvider({
+        providerId: input.providerId,
+        baseUrl: input.baseUrl,
+        apiKey: input.apiKey,
+      });
+      return result.message ?? "Connected";
+    }
+    try {
+      return await testOpenAICompatible(input.baseUrl, input.apiKey);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "";
+      if (
+        error instanceof TypeError ||
+        /Failed to fetch|CORS|NetworkError/i.test(message)
+      ) {
+        throw new Error(t("cowork.providers.cors_hint", currentLocale()));
+      }
+      throw error;
+    }
+  };
+
+  const firstRunHasWorkspace = createMemo(() => workspaceStore.workspaces().length > 0);
+  const firstRunHasProviderKey = createMemo(() =>
+    Object.values(coworkSecrets()).some((value) => value.trim().length > 0),
+  );
+  const firstRunSetupComplete = createMemo(
+    () => firstRunHasWorkspace() && firstRunHasProviderKey(),
+  );
+  const firstRunWizardBlocked = createMemo(
+    () => workspaceStore.createWorkspaceOpen() || workspaceStore.createRemoteWorkspaceOpen(),
+  );
+
+  const persistFirstRunDismissed = (next: boolean) => {
+    setFirstRunWizardDismissed(next);
+    if (typeof window === "undefined") return;
+    try {
+      if (next) {
+        window.localStorage.setItem(FIRST_RUN_WIZARD_DISMISSED_KEY, "1");
+      } else {
+        window.localStorage.removeItem(FIRST_RUN_WIZARD_DISMISSED_KEY);
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const dismissFirstRunWizard = () => {
+    persistFirstRunDismissed(true);
+    setFirstRunWizardOpen(false);
+  };
+
+  const openFirstRunWorkspace = () => {
+    setFirstRunWizardOpen(false);
+    workspaceStore.setCreateWorkspaceOpen(true);
+  };
+
+  const openFirstRunRemoteWorkspace = () => {
+    setFirstRunWizardOpen(false);
+    workspaceStore.setCreateRemoteWorkspaceOpen(true);
+  };
+
+  const openFirstRunProviderSettings = () => {
+    dismissFirstRunWizard();
+    setSettingsTab("providers");
+    setTab("settings");
+    setView("dashboard");
+  };
+
+  const openFirstRunStudio = () => {
+    dismissFirstRunWizard();
+    setTab("studio");
+    setView("dashboard");
+  };
+
+  const startFirstRunSession = () => {
+    setFirstRunWizardOpen(false);
+    setView("session");
+    void createSessionAndOpen();
+  };
+
+  const saveFirstRunProviderKey = async () => {
+    if (firstRunProviderBusy()) return;
+    const providerId = firstRunProviderId().trim();
+    const apiKey = firstRunApiKey().trim();
+    const provider = coworkProviders().find((item) => item.id === providerId) ?? null;
+
+    if (!provider) {
+      setFirstRunProviderError(t("setup.error_provider_required", currentLocale()));
+      setFirstRunProviderStatus(null);
+      return;
+    }
+    if (!apiKey) {
+      setFirstRunProviderError(t("setup.error_api_key_required", currentLocale()));
+      setFirstRunProviderStatus(null);
+      return;
+    }
+
+    setFirstRunProviderBusy(true);
+    setFirstRunProviderError(null);
+    setFirstRunProviderStatus(null);
+
+    try {
+      const testMessage = await testCoworkProvider({
+        providerId: provider.id,
+        baseUrl: provider.baseUrl,
+        apiKey,
+      });
+      await setCoworkProviderSecret(provider.id, apiKey);
+      const message = testMessage?.trim() || t("setup.provider_test_ok", currentLocale());
+      setFirstRunProviderStatus(`${message} · ${t("setup.provider_saved", currentLocale())}`);
+      setFirstRunApiKey("");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : t("setup.provider_save_failed", currentLocale());
+      setFirstRunProviderError(message);
+      setFirstRunProviderStatus(null);
+    } finally {
+      setFirstRunProviderBusy(false);
+    }
+  };
+
+  createEffect(() => {
+    const providers = coworkProviders();
+    if (!providers.length) {
+      setFirstRunProviderId("");
+      return;
+    }
+    const current = firstRunProviderId().trim();
+    if (current && providers.some((provider) => provider.id === current)) {
+      return;
+    }
+    const preferredProviderId = coworkDefaults().chat?.providerId ?? "";
+    const preferredByDefault = providers.find((provider) => provider.id === preferredProviderId);
+    const nextProvider = preferredByDefault ?? providers[0];
+    setFirstRunProviderId(nextProvider.id);
+  });
+
+  createEffect(() => {
+    firstRunProviderId();
+    setFirstRunProviderError(null);
+    setFirstRunProviderStatus(null);
+  });
+
+  createEffect(() => {
+    if (typeof window === "undefined") return;
+    if (booting()) return;
+    if (currentView() === "proto") {
+      setFirstRunWizardOpen(false);
+      return;
+    }
+    if (firstRunWizardBlocked()) {
+      setFirstRunWizardOpen(false);
+      return;
+    }
+    if (firstRunSetupComplete()) {
+      setFirstRunWizardOpen(false);
+      try {
+        window.localStorage.setItem("openwork.onboardingComplete", "1");
+      } catch {
+        // ignore
+      }
+      return;
+    }
+    if (firstRunWizardDismissed()) {
+      setFirstRunWizardOpen(false);
+      return;
+    }
+    setFirstRunWizardOpen(true);
+  });
 
   const [editRemoteWorkspaceOpen, setEditRemoteWorkspaceOpen] = createSignal(false);
   const [editRemoteWorkspaceId, setEditRemoteWorkspaceId] = createSignal<string | null>(null);
@@ -2754,6 +3195,9 @@ export default function App() {
         mcpEntryConfig["command"] = entry.command;
       }
       if (canUseOpenworkServer) {
+        if (!openworkWorkspaceId) {
+          throw new Error("Missing OpenWork workspace id.");
+        }
         await openworkClient.addMcp(openworkWorkspaceId, {
           name: slug,
           config: mcpEntryConfig,
@@ -3010,6 +3454,11 @@ export default function App() {
         );
         if (storedClientDir) {
           setClientDirectory(storedClientDir);
+        }
+
+        const storedWizardDismissed = window.localStorage.getItem(FIRST_RUN_WIZARD_DISMISSED_KEY);
+        if (storedWizardDismissed === "1") {
+          setFirstRunWizardDismissed(true);
         }
 
         const storedEngineSource = window.localStorage.getItem(
@@ -3581,23 +4030,26 @@ export default function App() {
       ? openworkServerCanWritePlugins()
       : isTauriRuntime();
     const canUseGlobalPluginScope = !isRemoteWorkspace && isTauriRuntime();
+    const webLocalSkillHint = !isRemoteWorkspace && !isTauriRuntime()
+      ? t("skills.access.web_local_limited", currentLocale())
+      : null;
     const skillsAccessHint = isRemoteWorkspace
       ? openworkStatus === "disconnected"
-        ? "OpenWork server unavailable. Connect to manage skills."
+        ? t("skills.access.remote_disconnected", currentLocale())
         : openworkStatus === "limited"
-          ? "OpenWork server needs a token to manage skills."
+          ? t("skills.access.remote_token_required", currentLocale())
           : openworkServerCanWriteSkills()
-            ? null
-            : "OpenWork server is read-only for skills."
-      : null;
+            ? webLocalSkillHint
+            : t("skills.access.remote_readonly", currentLocale())
+      : webLocalSkillHint;
     const pluginsAccessHint = isRemoteWorkspace
       ? openworkStatus === "disconnected"
-        ? "OpenWork server unavailable. Plugins are read-only."
+        ? t("skills.plugins_access.remote_disconnected", currentLocale())
         : openworkStatus === "limited"
-          ? "OpenWork server needs a token to edit plugins."
+          ? t("skills.plugins_access.remote_token_required", currentLocale())
           : openworkServerCanWritePlugins()
             ? null
-            : "OpenWork server is read-only for plugins."
+            : t("skills.plugins_access.remote_readonly", currentLocale())
       : null;
 
     return {
@@ -3615,6 +4067,21 @@ export default function App() {
       closeProviderAuthModal,
       startProviderAuth,
       submitProviderApiKey,
+      coworkProviders: coworkProviders(),
+      coworkDefaults: coworkDefaults(),
+      coworkProviderSecrets: coworkSecrets(),
+      coworkProviderSource: coworkProviderSource(),
+      coworkProviderStatus: coworkProviderStatus(),
+      coworkProviderError: coworkProviderError(),
+      refreshCoworkProviders: loadCoworkProviders,
+      saveCoworkProvider: upsertCoworkProvider,
+      deleteCoworkProvider: deleteCoworkProvider,
+      setCoworkDefaults: updateCoworkDefaults,
+      setCoworkProviderSecret: setCoworkProviderSecret,
+      clearCoworkProviderSecret: clearCoworkProviderSecret,
+      testCoworkProvider,
+      buildCoworkSnippet,
+      coworkProxy: coworkProxy(),
       view: currentView(),
       setView,
       startupPreference: startupPreference(),
@@ -3686,6 +4153,7 @@ export default function App() {
       importLocalSkill,
       installSkillCreator,
       revealSkillsFolder,
+      runSkill,
       uninstallSkill,
       pluginsAccessHint,
       canEditPlugins,
@@ -3790,6 +4258,7 @@ export default function App() {
 
   const sessionProps = () => ({
     selectedSessionId: activeSessionId(),
+    tab: tab(),
     setView,
     setTab,
     setSettingsTab,
@@ -3871,6 +4340,10 @@ export default function App() {
     setSessionAgent: setSessionAgent,
     saveSession: saveSessionExport,
     sessionStatusById: activeSessionStatusById(),
+    sseConnected: sseConnected(),
+    sessionLastEventAt: sessionLastEventAt(),
+    sessionLastError: sessionLastError(),
+    pendingPermissionsCount: pendingPermissions().length,
     searchFiles: searchWorkspaceFiles,
     deleteSession: deleteSessionById,
     onTryNotionPrompt: () => {
@@ -3890,6 +4363,7 @@ export default function App() {
 
   const dashboardTabs = new Set<DashboardTab>([
     "scheduled",
+    "studio",
     "skills",
     "plugins",
     "mcp",
@@ -4005,6 +4479,28 @@ export default function App() {
           <DashboardView {...dashboardProps()} />
         </Match>
       </Switch>
+
+      <FirstRunWizard
+        open={firstRunWizardOpen()}
+        canSkip={!firstRunSetupComplete()}
+        hasWorkspace={firstRunHasWorkspace()}
+        hasProviderKey={firstRunHasProviderKey()}
+        providers={coworkProviders()}
+        selectedProviderId={firstRunProviderId()}
+        apiKey={firstRunApiKey()}
+        savingProvider={firstRunProviderBusy()}
+        providerError={firstRunProviderError()}
+        providerStatus={firstRunProviderStatus()}
+        onSelectedProviderIdChange={setFirstRunProviderId}
+        onApiKeyChange={setFirstRunApiKey}
+        onCreateWorkspace={openFirstRunWorkspace}
+        onCreateRemoteWorkspace={openFirstRunRemoteWorkspace}
+        onOpenProviderSettings={openFirstRunProviderSettings}
+        onSaveProviderKey={saveFirstRunProviderKey}
+        onOpenStudio={openFirstRunStudio}
+        onCreateSession={startFirstRunSession}
+        onSkip={dismissFirstRunWizard}
+      />
 
       <WorkspaceSwitchOverlay
         open={workspaceSwitchOpen()}

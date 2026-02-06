@@ -115,6 +115,8 @@ export function createSessionStore(options: {
   developerMode: () => boolean;
   setError: (message: string | null) => void;
   setSseConnected: (connected: boolean) => void;
+  onEventTimestamp?: (timestamp: number) => void;
+  onSessionError?: (message: string) => void;
   markReloadRequired?: (reason: ReloadReason, trigger?: ReloadTrigger) => void;
 }) {
   const [store, setStore] = createStore<StoreState>({
@@ -533,6 +535,7 @@ export function createSessionStore(options: {
   const [questionReplyBusy, setQuestionReplyBusy] = createSignal(false);
 
   const applyEvent = async (event: OpencodeEvent) => {
+    options.onEventTimestamp?.(Date.now());
     if (event.type === "server.connected") {
       options.setSseConnected(true);
     }
@@ -589,6 +592,15 @@ export function createSessionStore(options: {
         const record = event.properties as Record<string, unknown>;
         const errorObj = record.error as Record<string, unknown> | undefined;
         if (errorObj) {
+          const errorData = (errorObj.data && typeof errorObj.data === "object")
+            ? (errorObj.data as Record<string, unknown>)
+            : null;
+          const directMessage = typeof errorObj.message === "string" ? errorObj.message.trim() : "";
+          const nestedMessage = errorData && typeof errorData.message === "string"
+            ? errorData.message.trim()
+            : "";
+          const normalizedMessage = directMessage || nestedMessage;
+
           // Handle different error types from OpenCode
           const errorName = typeof errorObj.name === "string" ? errorObj.name : "Unknown";
           let message = "An error occurred";
@@ -596,12 +608,12 @@ export function createSessionStore(options: {
           if (errorName === "ProviderAuthError") {
             // Provider auth error - likely 401/403 from the API
             const providerID = typeof errorObj.providerID === "string" ? errorObj.providerID : "provider";
-            const errorMessage = typeof errorObj.message === "string" ? errorObj.message : "";
+            const errorMessage = normalizedMessage;
             message = errorMessage || `Authentication failed for ${providerID}. Please reconnect or check your API key.`;
           } else if (errorName === "APIError") {
             // API error - includes status code
             const statusCode = typeof errorObj.statusCode === "number" ? errorObj.statusCode : undefined;
-            const errorMessage = typeof errorObj.message === "string" ? errorObj.message : "";
+            const errorMessage = normalizedMessage;
             if (statusCode === 401 || statusCode === 403) {
               message = errorMessage || "Authentication failed. Please check your API key or reconnect the provider.";
             } else if (statusCode === 429) {
@@ -610,16 +622,20 @@ export function createSessionStore(options: {
               message = errorMessage || `API error${statusCode ? ` (${statusCode})` : ""}`;
             }
           } else if (errorName === "MessageAbortedError") {
-            const errorMessage = typeof errorObj.message === "string" ? errorObj.message : "";
+            const errorMessage = normalizedMessage;
             message = errorMessage || "Request was cancelled";
           } else if (errorName === "MessageOutputLengthError") {
             message = "Output length limit exceeded";
           } else {
             // Unknown or other error
-            const errorMessage = typeof errorObj.message === "string" ? errorObj.message : "";
-            message = errorMessage || "An unexpected error occurred";
+            if (/sdk\.responses is not a function/i.test(normalizedMessage)) {
+              message = "Selected model/runtime mismatch. Switch session model to your configured provider (for example NVIDIA Integrate) or update OpenCode/OpenWork to matching versions.";
+            } else {
+              message = normalizedMessage || "An unexpected error occurred";
+            }
           }
 
+          options.onSessionError?.(message);
           options.setError(addOpencodeCacheHint(message));
         }
       }
@@ -679,14 +695,38 @@ export function createSessionStore(options: {
               const parts = draft.parts[part.messageID] ?? [];
               const existingIndex = parts.findIndex((item) => item.id === part.id);
 
-              if (delta && part.type === "text" && existingIndex !== -1) {
+              if ((part.type === "text" || part.type === "reasoning") && existingIndex !== -1) {
                 const existing = parts[existingIndex] as Part & { text?: string };
-                if (typeof existing.text === "string" && !existing.text.endsWith(delta)) {
-                  const next = { ...existing, text: `${existing.text}${delta}` } as Part;
-                  parts[existingIndex] = next;
-                  draft.parts[part.messageID] = parts;
-                  return;
+                const existingText = typeof existing.text === "string" ? existing.text : "";
+                const incomingText = typeof (part as { text?: string }).text === "string"
+                  ? String((part as { text?: string }).text ?? "")
+                  : "";
+                let mergedText = incomingText;
+
+                if (delta) {
+                  if (!incomingText) {
+                    mergedText = existingText ? `${existingText}${delta}` : delta;
+                  } else if (incomingText.startsWith(existingText)) {
+                    mergedText = incomingText;
+                  } else if (existingText.endsWith(delta)) {
+                    mergedText = existingText;
+                  } else {
+                    mergedText = `${existingText}${delta}`;
+                  }
+                } else if (existingText) {
+                  if (!incomingText) {
+                    mergedText = existingText;
+                  } else if (incomingText.length < existingText.length && existingText.startsWith(incomingText)) {
+                    mergedText = existingText;
+                  } else if (!incomingText.startsWith(existingText) && !existingText.startsWith(incomingText)) {
+                    mergedText = incomingText.length >= existingText.length ? incomingText : existingText;
+                  }
                 }
+
+                const next = { ...existing, ...part, text: mergedText } as Part;
+                parts[existingIndex] = next;
+                draft.parts[part.messageID] = parts;
+                return;
               }
 
               draft.parts[part.messageID] = upsertPartInfo(parts, part);
@@ -703,7 +743,22 @@ export function createSessionStore(options: {
         const messageID = typeof record.messageID === "string" ? record.messageID : null;
         const partID = typeof record.partID === "string" ? record.partID : null;
         if (messageID && partID) {
-          setStore("parts", messageID, (current = []) => removePartInfo(current, partID));
+          setStore(
+            produce((draft: StoreState) => {
+              const current = draft.parts[messageID] ?? [];
+              const existing = current.find((part) => part.id === partID) as
+                | (Part & { text?: string })
+                | undefined;
+              const reasoningText =
+                existing?.type === "reasoning" && typeof existing.text === "string"
+                  ? existing.text.trim()
+                  : "";
+              if (reasoningText) {
+                return;
+              }
+              draft.parts[messageID] = removePartInfo(current, partID);
+            }),
+          );
         }
       }
     }
@@ -761,6 +816,10 @@ export function createSessionStore(options: {
       if (event.type === "message.part.updated") {
         const record = event.properties as Record<string, unknown> | undefined;
         const part = record?.part as Part | undefined;
+        const delta = typeof record?.delta === "string" ? record.delta : null;
+        if (delta) {
+          return undefined;
+        }
         if (part?.messageID && part.id) {
           return `message.part.updated:${part.messageID}:${part.id}`;
         }

@@ -12,14 +12,16 @@ export type Locale = Language;
 /**
  * All supported languages - single source of truth
  */
-export const LANGUAGES: Language[] = ["en", "zh"];
+export const LANGUAGES: Language[] = ["zh", "en"];
+
+const DEFAULT_LANGUAGE: Language = "zh";
 
 /**
  * Language options for UI - single source of truth
  */
 export const LANGUAGE_OPTIONS = [
-  { value: "en" as Language, label: "English", nativeName: "English" },
   { value: "zh" as Language, label: "简体中文", nativeName: "简体中文" },
+  { value: "en" as Language, label: "English", nativeName: "English" },
 ] as const;
 
 /**
@@ -41,7 +43,7 @@ export const isLanguage = (value: unknown): value is Language => {
 /**
  * Create root-level locale signal with persistence
  */
-const [locale, setLocaleSignal] = createRoot(() => createSignal<Language>("en"));
+const [locale, setLocaleSignal] = createRoot(() => createSignal<Language>(DEFAULT_LANGUAGE));
 
 /**
  * Get current locale
@@ -53,8 +55,8 @@ export const currentLocale = (): Language => locale();
  */
 export const setLocale = (newLocale: Language) => {
   if (!isLanguage(newLocale)) {
-    console.warn(`Invalid locale: ${newLocale}, falling back to "en"`);
-    newLocale = "en";
+    console.warn(`Invalid locale: ${newLocale}, falling back to "${DEFAULT_LANGUAGE}"`);
+    newLocale = DEFAULT_LANGUAGE;
   }
 
   setLocaleSignal(newLocale);
@@ -100,7 +102,7 @@ export const t = (key: string, localeOverride?: Language): string => {
  */
 export const initLocale = (): Language => {
   if (typeof window === "undefined") {
-    return "en";
+    return DEFAULT_LANGUAGE;
   }
 
   try {
@@ -113,5 +115,5 @@ export const initLocale = (): Language => {
     console.warn("Failed to read language preference:", e);
   }
 
-  return "en";
+  return DEFAULT_LANGUAGE;
 };
