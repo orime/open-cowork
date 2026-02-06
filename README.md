@@ -139,6 +139,12 @@ My First Cowork 的目标是把 OpenCode 能力变成「可视化、可配置、
 
 ## 5. 启动方式（按场景）
 
+### 5.0 前置条件
+
+- Node.js + pnpm（项目依赖与脚本运行）
+- Bun（用于构建 openwork-server/sidecars）
+- opencode CLI（本地引擎服务）
+
 ### 5.1 只看 UI（最快）
 
 ```bash

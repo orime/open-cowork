@@ -51,6 +51,26 @@ const logLine = (message: string) => {
   process.stdout.write(`${message}\n`);
 };
 
+const commandExists = async (command: string) => {
+  const probe = spawn(process.platform === "win32" ? "where" : "which", [command], {
+    stdio: "ignore",
+  });
+  const code = await new Promise<number>((resolve) => {
+    probe.once("exit", (exitCode) => resolve(exitCode ?? 1));
+  });
+  return code === 0;
+};
+
+const ensureBun = async () => {
+  const hasBun = await commandExists("bun");
+  if (!hasBun) {
+    logLine("[dev:headless-web] Missing dependency: bun");
+    logLine("[dev:headless-web] Bun is required to build openwork-server/sidecars.");
+    logLine("[dev:headless-web] Install Bun: https://bun.sh");
+    process.exit(1);
+  }
+};
+
 const spawnLogged = (command: string, args: string[], logPath: string, env: NodeJS.ProcessEnv) => {
   const logFd = openSync(logPath, "w");
   return spawn(command, args, {
@@ -67,6 +87,7 @@ const shutdown = (label: string, code: number | null, signal: NodeJS.Signals | n
 };
 
 await ensureTmp();
+await ensureBun();
 
 const host = process.env.OPENWORK_HOST ?? "0.0.0.0";
 const viteHost = process.env.VITE_HOST ?? process.env.HOST ?? host;
